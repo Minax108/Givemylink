@@ -144,12 +144,26 @@ def login_instagram():
                 f.write(session_data)
             logger.info("Instagram: session file created from env var.")
         
-        # Priority 2: Use existing session file
+        # Priority 2: Use existing session file WITHOUT re-authenticating password
         if os.path.exists(session_file):
             ig_client.load_settings(session_file)
-            ig_client.login(BOT_INSTAGRAM_USERNAME, BOT_INSTAGRAM_PASSWORD)
-            ig_client.dump_settings(session_file)
-            logger.info("Instagram: logged in using saved session.")
+            # Extract sessionid from the saved settings and login by session only
+            settings = ig_client.get_settings()
+            session_id = settings.get("authorization_data", {}).get("sessionid", "")
+            if not session_id:
+                session_id = settings.get("cookies", {}).get("sessionid", "")
+            
+            if session_id:
+                logger.info("Instagram: logging in by sessionid (no password needed)...")
+                ig_client.login_by_sessionid(session_id)
+                ig_client.dump_settings(session_file)
+                logger.info(f"Instagram: session login successful as @{ig_client.username}")
+            else:
+                # No sessionid in file, try password login
+                logger.info("Instagram: no sessionid in session file, trying password login...")
+                ig_client.login(BOT_INSTAGRAM_USERNAME, BOT_INSTAGRAM_PASSWORD)
+                ig_client.dump_settings(session_file)
+                logger.info("Instagram: password login succeeded.")
         else:
             # Priority 3: Fresh login with a brand-new device fingerprint
             ig_client = _build_fresh_client()
