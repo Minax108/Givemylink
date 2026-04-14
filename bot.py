@@ -53,6 +53,13 @@ ig_logged_in = False
 # Track pending requests: {telegram_user_id: {"reel_url": ..., "timestamp": ...}}
 pending_requests = {}
 
+# Instagram DM listener state
+ig_dm_pending = {}          # {ig_user_pk: {"shortcode": ..., "thread_id": ..., "timestamp": ...}}
+ig_dm_processed = set()     # Set of processed DM item_ids to avoid re-processing
+ig_dm_last_check = 0.0      # Timestamp of last DM check
+waiting_for_owners = set()  # Reel owner user IDs we're currently waiting for DM responses
+IG_DM_CHECK_INTERVAL = 15   # How often to check for new IG DM requests (seconds)
+
 # Concurrency primitives (initialized in main)
 ig_lock = None           # asyncio.Lock — protects login/session state
 ig_semaphore = None      # asyncio.Semaphore — limits concurrent IG API calls
@@ -281,6 +288,314 @@ def check_dms_for_link(reel_owner_id: int, after_timestamp: float) -> str | None
         return None
 
 
+# ─── INSTAGRAM DM HANDLING ────────────────────────────────────────────────────
+
+def send_dm_reply(thread_id: int, text: str):
+    """Send a reply in an Instagram DM thread."""
+    ig_client.direct_answer(thread_id=thread_id, text=text)
+
+
+def fetch_dm_inbox():
+    """Fetch recent Instagram DM threads with their latest messages (blocking)."""
+    results = []
+    try:
+        threads = ig_client.direct_threads(amount=20)
+        logger.info(f"[IG DM] Fetched {len(threads)} main inbox threads")
+
+        # Fetch pending inbox using raw API to avoid Pydantic validation errors
+        try:
+            raw_pending = ig_client.private_request(
+                "direct_v2/pending_inbox/",
+                params={"visual_message_return_type": "unseen", "persistentBadging": "true",
+                        "is_prefetching": "false"},
+            )
+            pending_threads = raw_pending.get("inbox", {}).get("threads", [])
+            logger.info(f"[IG DM] Fetched {len(pending_threads)} pending inbox threads (raw)")
+
+            for pt in pending_threads:
+                pt_id = pt.get("thread_id", "")
+                # Auto-approve pending threads
+                try:
+                    ig_client.private_request(
+                        f"direct_v2/threads/{pt_id}/approve/",
+                        data={},
+                        with_signature=False,
+                    )
+                    logger.info(f"[IG DM] Approved pending thread {pt_id}")
+                except Exception as e:
+                    logger.warning(f"[IG DM] Could not approve pending thread {pt_id}: {e}")
+
+                # Extract thread data directly from raw response
+                items = pt.get("items", [])
+                users = pt.get("users", [])
+                user_list = [(u.get("pk", 0), u.get("username", "unknown")) for u in users]
+                if user_list and items:
+                    results.append({
+                        "thread_id": int(pt_id),
+                        "users": user_list,
+                        "items": items,
+                    })
+        except Exception as e:
+            logger.warning(f"[IG DM] Error fetching pending inbox: {e}")
+
+        for thread in threads:
+            try:
+                raw = ig_client.private_request(
+                    f"direct_v2/threads/{thread.id}/",
+                    params={"direction": "older", "limit": "5"},
+                )
+                items = raw.get("thread", {}).get("items", [])
+                results.append({
+                    "thread_id": int(thread.id),
+                    "users": [(u.pk, u.username) for u in thread.users],
+                    "items": items,
+                })
+            except Exception:
+                continue
+    except Exception as e:
+        logger.error(f"Error fetching DM inbox: {e}")
+    return results
+
+
+async def process_ig_dm_request(user_pk: int, username: str, thread_id: int, reel_url: str):
+    """Process a reel link request received via Instagram DM."""
+    global ig_logged_in
+
+    shortcode = extract_shortcode(reel_url)
+    if not shortcode:
+        await run_ig(send_dm_reply, thread_id, "Could not parse that URL. Send a valid Instagram reel link.")
+        return
+
+    ig_dm_pending[user_pk] = {"shortcode": shortcode, "thread_id": thread_id, "timestamp": time.time()}
+    owner_id = None
+
+    try:
+        await run_ig(send_dm_reply, thread_id, "Processing your reel link request...")
+
+        # Get reel owner
+        owner_info = await run_ig(get_reel_owner, shortcode)
+        if not owner_info:
+            await run_ig(send_dm_reply, thread_id, "Couldn't find this reel. Check the URL and try again.")
+            ig_dm_pending.pop(user_pk, None)
+            return
+
+        owner_username = owner_info.get("username", "unknown")
+        owner_id = owner_info["user_id"]
+
+        # Auto-detect keyword
+        final_keyword = await run_ig(get_best_keyword, shortcode)
+        logger.info(f"[IG DM] Keyword for {shortcode}: '{final_keyword}'")
+
+        # Follow creator
+        try:
+            await run_ig(follow_user, owner_id)
+        except Exception:
+            pass
+
+        # Comment on reel
+        waiting_for_owners.add(owner_id)
+        timestamp_before = time.time()
+
+        try:
+            await run_ig(comment_on_reel, shortcode, final_keyword)
+            await run_ig(send_dm_reply, thread_id,
+                f"Commented '{final_keyword}' on @{owner_username}'s reel. Waiting for the link...")
+        except Exception as e:
+            waiting_for_owners.discard(owner_id)
+            ig_dm_pending.pop(user_pk, None)
+            await run_ig(send_dm_reply, thread_id, f"Couldn't comment on the reel: {str(e)}")
+            return
+
+        # Poll for DM response from reel owner
+        link_found = None
+        elapsed = 0
+        while elapsed < DM_WAIT_TIME:
+            try:
+                link_found = await run_ig(check_dms_for_link, owner_id, timestamp_before)
+                if link_found:
+                    break
+            except Exception as e:
+                logger.error(f"[IG DM] Poll error for @{username}: {e}")
+
+            await asyncio.sleep(DM_CHECK_INTERVAL)
+            elapsed += DM_CHECK_INTERVAL
+
+        # Cleanup
+        waiting_for_owners.discard(owner_id)
+        ig_dm_pending.pop(user_pk, None)
+
+        # Send result
+        if link_found:
+            await run_ig(send_dm_reply, thread_id, f"Here's your link:\n\n{link_found}")
+            logger.info(f"[IG DM] Got link for @{username}: {link_found}")
+        else:
+            await run_ig(send_dm_reply, thread_id,
+                f"No response from @{owner_username}. They might not have automation set up, or the keyword '{final_keyword}' was wrong.")
+
+    except Exception as e:
+        logger.error(f"[IG DM] Error processing request from @{username}: {e}")
+        if owner_id:
+            waiting_for_owners.discard(owner_id)
+        ig_dm_pending.pop(user_pk, None)
+        try:
+            await run_ig(send_dm_reply, thread_id, "Something went wrong. Please try again later.")
+        except Exception:
+            pass
+
+
+async def ig_dm_listener():
+    """Background task: polls Instagram DMs for new reel link requests."""
+    global ig_dm_last_check
+
+    await asyncio.sleep(20)  # let login settle
+    first_scan = True
+    logger.info("Instagram DM listener started")
+
+    while True:
+        try:
+            if not ig_logged_in:
+                await asyncio.sleep(IG_DM_CHECK_INTERVAL)
+                continue
+
+            # Cap processed set to prevent memory leak
+            if len(ig_dm_processed) > 5000:
+                ig_dm_processed.clear()
+
+            threads_data = await run_ig(fetch_dm_inbox)
+            logger.info(f"[IG DM] Scanned {len(threads_data)} threads, ig_dm_last_check={ig_dm_last_check:.0f}")
+
+            for td in threads_data:
+                thread_id = td["thread_id"]
+                if not td["users"]:
+                    continue
+
+                # Get the other user in this 1-on-1 DM
+                user_pk, username = td["users"][0]
+
+                # Skip reel owners we're waiting for, and users with pending requests
+                if user_pk in waiting_for_owners or user_pk in ig_dm_pending:
+                    continue
+
+                items = td["items"]
+                if items:
+                    logger.info(f"[IG DM] Thread with @{username} ({user_pk}): {len(items)} items")
+
+                for idx, item in enumerate(items):
+                    item_id = item.get("item_id", "")
+                    if item_id in ig_dm_processed:
+                        continue
+
+                    sender = item.get("user_id")
+                    item_type = item.get("item_type", "unknown")
+                    logger.info(f"[IG DM] @{username} item #{idx}: type={item_type}, sender={sender}, bot_id={ig_client.user_id}")
+                    if str(sender) == str(ig_client.user_id):
+                        ig_dm_processed.add(item_id)
+                        continue
+
+                    # On the very first scan, only process the newest message per thread
+                    # to avoid replaying old conversations
+                    if first_scan and idx > 0:
+                        ig_dm_processed.add(item_id)
+                        continue
+
+                    item_type = item.get("item_type", "")
+                    logger.info(f"[IG DM] Message from @{username}: type={item_type}, item_id={item_id}")
+
+                    reel_url = None
+
+                    # Handle shared reels (when user taps share button on a reel)
+                    if item_type in ("media_share", "clip", "felix_share", "reel_share", "story_share"):
+                        media = item.get("media_share") or item.get("clip", {}).get("clip") or item.get("felix_share_reel_media") or {}
+                        if not media and "media" in item:
+                            media = item["media"]
+                        shortcode = media.get("code", "")
+                        if shortcode:
+                            reel_url = f"https://www.instagram.com/reel/{shortcode}/"
+                            logger.info(f"[IG DM] Extracted reel from share: {reel_url}")
+                        else:
+                            # Try to find it in nested structures
+                            for key in ("media_share", "clip", "felix_share_reel_media", "reel_share"):
+                                nested = item.get(key, {})
+                                if isinstance(nested, dict):
+                                    sc = nested.get("code", "")
+                                    if sc:
+                                        reel_url = f"https://www.instagram.com/reel/{sc}/"
+                                        logger.info(f"[IG DM] Extracted reel from {key}: {reel_url}")
+                                        break
+
+                    # Handle text messages with URLs
+                    elif item_type == "text":
+                        text = item.get("text", "") or ""
+                        reel_url = extract_reel_url(text)
+
+                    # Handle link-type messages
+                    elif item_type == "link":
+                        link_data = item.get("link", {})
+                        link_text = link_data.get("text", "") or link_data.get("link_url", "") or ""
+                        reel_url = extract_reel_url(link_text)
+
+                    # Handle xma (shared content cards — reels, posts, links)
+                    elif item_type in ("xma_media_share", "generic_xma", "xma_link", "xma_reel_share"):
+                        # Log raw xma data for debugging
+                        xma_data = item.get("generic_xma") or item.get("xma_media_share") or item.get("xma_link") or []
+                        logger.info(f"[IG DM] XMA data from @{username}: {xma_data}")
+
+                        # Search all string values in the XMA structure for Instagram URLs
+                        def find_reel_in_data(data):
+                            if isinstance(data, str):
+                                return extract_reel_url(data)
+                            elif isinstance(data, list):
+                                for item_x in data:
+                                    result = find_reel_in_data(item_x)
+                                    if result:
+                                        return result
+                            elif isinstance(data, dict):
+                                # Check high-priority keys first
+                                for key in ("target_url", "preview_url", "header_icon_url", "preview_url_mime_type",
+                                            "title_text", "header_title_text", "text", "url", "link_url"):
+                                    val = data.get(key, "")
+                                    if val:
+                                        result = extract_reel_url(str(val))
+                                        if result:
+                                            return result
+                                # Then check all values
+                                for val in data.values():
+                                    result = find_reel_in_data(val)
+                                    if result:
+                                        return result
+                            return None
+
+                        reel_url = find_reel_in_data(xma_data)
+                        if reel_url:
+                            logger.info(f"[IG DM] Found reel URL in XMA: {reel_url}")
+
+                    else:
+                        logger.info(f"[IG DM] Unhandled item_type '{item_type}' from @{username}, keys: {list(item.keys())}")
+
+                    ig_dm_processed.add(item_id)
+
+                    if reel_url:
+                        logger.info(f"[IG DM] New request from @{username}: {reel_url}")
+                        asyncio.create_task(
+                            process_ig_dm_request(user_pk, username, thread_id, reel_url)
+                        )
+                        break  # one request per user at a time
+                    elif item_type == "text" and (item.get("text", "") or "").strip():
+                        # User sent text that's not a reel URL — send help
+                        try:
+                            await run_ig(send_dm_reply, thread_id,
+                                "Hey! Send me an Instagram reel link and I'll get the hidden resource link for you.\n\nYou can either share a reel directly or paste a link like:\nhttps://www.instagram.com/reel/ABC123/")
+                        except Exception:
+                            pass
+                        break
+
+        except Exception as e:
+            logger.error(f"[IG DM] Listener error: {e}")
+
+        first_scan = False
+        await asyncio.sleep(IG_DM_CHECK_INTERVAL)
+
+
 # ─── TELEGRAM HANDLERS ─────────────────────────────────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -307,7 +622,8 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"✅ Bot is **online**\n"
             f"📸 Instagram: `@{BOT_INSTAGRAM_USERNAME}`\n"
-            f"📊 Active requests: {len(pending_requests)}\n"
+            f"📊 Telegram requests: {len(pending_requests)}\n"
+            f"📬 IG DM requests: {len(ig_dm_pending)}\n"
             f"🔧 Max concurrent: {MAX_CONCURRENT_IG_CALLS}",
             parse_mode="Markdown"
         )
@@ -321,12 +637,15 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Re-login to Instagram and clear pending requests."""
-    global ig_logged_in, pending_requests
+    global ig_logged_in, pending_requests, ig_dm_last_check
 
     msg = await update.message.reply_text("🔄 Restarting Instagram session...")
 
     # Clear pending requests
     pending_requests.clear()
+    ig_dm_pending.clear()
+    ig_dm_processed.clear()
+    waiting_for_owners.clear()
 
     # Delete old session and re-login
     async with ig_lock:
@@ -342,6 +661,7 @@ async def restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await loop.run_in_executor(thread_pool, login_instagram)
 
     if ig_logged_in:
+        ig_dm_last_check = time.time()
         await msg.edit_text(
             f"✅ **Restarted successfully!**\n\n"
             f"📸 Instagram: `@{BOT_INSTAGRAM_USERNAME}`\n"
@@ -439,6 +759,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.info(f"Could not follow user {owner_id} (or already following): {e}")
 
     # Step 3: Comment on the reel
+    waiting_for_owners.add(owner_id)
     timestamp_before_comment = time.time()
     pending_requests[user_id] = {"shortcode": shortcode, "timestamp": timestamp_before_comment}
 
@@ -454,6 +775,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except instagrapi.exceptions.LoginRequired:
         ig_logged_in = False
         pending_requests.pop(user_id, None)
+        waiting_for_owners.discard(owner_id)
         await status_msg.edit_text(
             "⚠️ Instagram session expired. Reconnecting...\nPlease try sending the link again.",
             parse_mode="Markdown"
@@ -462,6 +784,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     except Exception as e:
         pending_requests.pop(user_id, None)
+        waiting_for_owners.discard(owner_id)
         await status_msg.edit_text(
             f"❌ Couldn't comment on the reel.\n\n"
             f"**Reason:** {str(e)}\n\n"
@@ -500,6 +823,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Clean up pending request
     pending_requests.pop(user_id, None)
+    waiting_for_owners.discard(owner_id)
 
     # Step 5: Send result to user
     if link_found:
@@ -540,18 +864,31 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 LOCK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot.lock")
 
 
+def _is_pid_alive(pid: int) -> bool:
+    """Check if a process with the given PID is still running (cross-platform)."""
+    if sys.platform == "win32":
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(0x1000, False, pid)
+        if handle:
+            kernel32.CloseHandle(handle)
+            return True
+        return False
+    else:
+        try:
+            os.kill(pid, 0)  # signal 0 = just check if process exists
+            return True
+        except OSError:
+            return False
+
+
 def acquire_lock():
     """Ensure only one bot instance runs at a time using a lockfile with PID check."""
     if os.path.exists(LOCK_FILE):
         try:
             with open(LOCK_FILE, "r") as f:
                 old_pid = int(f.read().strip())
-            # Check if that PID is still alive
-            import ctypes
-            kernel32 = ctypes.windll.kernel32
-            handle = kernel32.OpenProcess(0x1000, False, old_pid)  # PROCESS_QUERY_LIMITED_INFORMATION
-            if handle:
-                kernel32.CloseHandle(handle)
+            if _is_pid_alive(old_pid):
                 print(f"❌ Another bot instance is already running (PID {old_pid}).")
                 print("   Kill it first, or delete bot.lock if it's stale.")
                 sys.exit(1)
@@ -575,19 +912,24 @@ def release_lock():
 def main():
     global ig_lock, ig_semaphore, thread_pool
 
-    if TELEGRAM_BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN":
-        print("=" * 55)
-        print("⚠️  Set your TELEGRAM_BOT_TOKEN in bot.py (line 22)")
-        print("   → Get one from @BotFather on Telegram")
-        print("=" * 55)
-        return
+    missing = []
+    if not TELEGRAM_BOT_TOKEN or TELEGRAM_BOT_TOKEN == "YOUR_TELEGRAM_BOT_TOKEN":
+        missing.append("TELEGRAM_BOT_TOKEN")
+    if not BOT_INSTAGRAM_USERNAME or BOT_INSTAGRAM_USERNAME == "YOUR_BOT_INSTAGRAM_USERNAME":
+        missing.append("BOT_INSTAGRAM_USERNAME")
+    if not BOT_INSTAGRAM_PASSWORD or BOT_INSTAGRAM_PASSWORD == "YOUR_BOT_INSTAGRAM_PASSWORD":
+        missing.append("BOT_INSTAGRAM_PASSWORD")
 
-    if BOT_INSTAGRAM_USERNAME == "YOUR_BOT_INSTAGRAM_USERNAME":
-        print("=" * 55)
-        print("⚠️  Set your BOT_INSTAGRAM_USERNAME in bot.py (line 26)")
-        print("   → Create a dedicated Instagram account for this bot")
-        print("=" * 55)
-        return
+    if missing:
+        print("=" * 60)
+        print("❌  Missing required environment variables:")
+        for var in missing:
+            print(f"   • {var}")
+        print("")
+        print("   Set them in your .env file (local) or in your")
+        print("   cloud provider's environment/secrets dashboard.")
+        print("=" * 60)
+        sys.exit(1)
 
     # Prevent multiple instances from running at the same time
     acquire_lock()
@@ -605,7 +947,11 @@ def main():
     else:
         print("⚠️ Instagram login failed — will retry on first request")
 
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    async def post_init(application):
+        """Start the Instagram DM listener background task."""
+        asyncio.create_task(ig_dm_listener())
+
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("status", status_cmd))
@@ -616,6 +962,7 @@ def main():
     print("")
     print("🤖 Reel Link Bot is running!")
     print(f"⚡ Concurrency: {MAX_CONCURRENT_IG_CALLS} simultaneous IG calls, {THREAD_POOL_SIZE} threads")
+    print("📬 Instagram DM listener: active")
     print("📱 Open Telegram → Send /start to your bot")
     print("🛑 Press Ctrl+C to stop")
     print("")
