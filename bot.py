@@ -47,7 +47,62 @@ THREAD_POOL_SIZE = 10          # thread pool workers for blocking IG calls
 
 # ──────────────────────────────────────────────────────────────────────────────
 
-ig_client = Client()
+import uuid
+import random
+
+# Challenge code storage (set externally via /code Telegram command)
+_challenge_code = None
+
+def challenge_code_handler(username, choice):
+    """Called by instagrapi when Instagram requires a verification code."""
+    global _challenge_code
+    logger.info(f"Instagram challenge requested for {username} (method: {choice})")
+    logger.info("Waiting for verification code... Use /code <digits> in Telegram to provide it.")
+    # Wait up to 120 seconds for the code to be provided
+    for _ in range(120):
+        if _challenge_code:
+            code = _challenge_code
+            _challenge_code = None
+            logger.info(f"Challenge code received: {code}")
+            return code
+        time.sleep(1)
+    logger.error("Challenge code timeout — no code provided within 120 seconds")
+    return ""
+
+
+def _build_fresh_client() -> Client:
+    """Create a new instagrapi Client with a randomized device fingerprint."""
+    cl = Client()
+    cl.delay_range = [2, 5]  # random delay between API calls (looks human)
+
+    # Generate a random Android device fingerprint to avoid IP+device blacklisting
+    cl.set_device({
+        "app_version": "269.0.0.18.75",
+        "android_version": random.randint(26, 33),
+        "android_release": f"{random.randint(10, 14)}.0",
+        "dpi": random.choice(["480dpi", "640dpi", "320dpi"]),
+        "resolution": random.choice(["1080x1920", "1440x2560", "1080x2400"]),
+        "manufacturer": random.choice(["Samsung", "OnePlus", "Google", "Xiaomi"]),
+        "device": random.choice(["star2qltechn", "beyond1", "OnePlus6T", "jasmine_sprout"]),
+        "model": random.choice(["SM-G965F", "SM-G973F", "ONEPLUS A6013", "Mi A2"]),
+        "cpu": random.choice(["qcom", "exynos9810", "samsungexynos9820"]),
+        "version_code": "314665256",
+    })
+    # Random user-agent based on above
+    cl.set_user_agent(
+        f"Instagram 269.0.0.18.75 Android ({cl.device.get('android_version', 30)}/{cl.device.get('android_release', '13.0')}; "
+        f"{cl.device.get('dpi', '480dpi')}; {cl.device.get('resolution', '1080x1920')}; "
+        f"{cl.device.get('manufacturer', 'Samsung')}; {cl.device.get('model', 'SM-G965F')}; "
+        f"{cl.device.get('device', 'star2qltechn')}; {cl.device.get('cpu', 'qcom')}; en_US; 314665256)"
+    )
+
+    # Set the challenge handler
+    cl.challenge_code_handler = challenge_code_handler
+
+    return cl
+
+
+ig_client = _build_fresh_client()
 ig_logged_in = False
 
 # Track pending requests: {telegram_user_id: {"reel_url": ..., "timestamp": ...}}
@@ -75,20 +130,33 @@ async def run_ig(func, *args):
 
 def login_instagram():
     """Log in to the bot's dedicated Instagram account."""
-    global ig_logged_in
+    global ig_logged_in, ig_client
     try:
         session_file = "ig_session.json"
         if os.path.exists(session_file):
             ig_client.load_settings(session_file)
             ig_client.login(BOT_INSTAGRAM_USERNAME, BOT_INSTAGRAM_PASSWORD)
+            ig_client.dump_settings(session_file)
             logger.info("Instagram: logged in using saved session.")
         else:
+            # Fresh login with a brand-new device fingerprint
+            ig_client = _build_fresh_client()
+            logger.info("Instagram: attempting fresh login with new device fingerprint...")
+            time.sleep(random.uniform(2, 5))  # human-like delay before login
             ig_client.login(BOT_INSTAGRAM_USERNAME, BOT_INSTAGRAM_PASSWORD)
             ig_client.dump_settings(session_file)
-            logger.info("Instagram: fresh login, session saved.")
+            logger.info("Instagram: fresh login succeeded, session saved.")
         ig_logged_in = True
     except Exception as e:
         logger.error(f"Instagram login failed: {e}")
+        # Remove stale session so next attempt starts fresh
+        session_file = "ig_session.json"
+        if os.path.exists(session_file):
+            try:
+                os.remove(session_file)
+                logger.info("Removed stale session file for next retry")
+            except OSError:
+                pass
         ig_logged_in = False
 
 
@@ -676,6 +744,19 @@ async def restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+async def code_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Provide an Instagram verification code for login challenge."""
+    global _challenge_code
+    if not context.args:
+        await update.message.reply_text(
+            "🔑 **Usage:** `/code 123456`\n\n"
+            "Send the verification code Instagram sent to your email/phone.",
+            parse_mode="Markdown"
+        )
+        return
+    _challenge_code = context.args[0].strip()
+    await update.message.reply_text(f"✅ Code `{_challenge_code}` received — applying to login challenge...", parse_mode="Markdown")
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Main handler: user sends a reel URL → bot comments → waits for DM → sends link back."""
     global ig_logged_in
@@ -956,6 +1037,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("restart", restart))
+    app.add_handler(CommandHandler("code", code_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
 
