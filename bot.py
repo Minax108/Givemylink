@@ -133,13 +133,25 @@ def login_instagram():
     global ig_logged_in, ig_client
     try:
         session_file = "ig_session.json"
+        
+        # Priority 1: Load session from env var (pre-authenticated, bypasses IP blocks)
+        session_b64 = os.environ.get("IG_SESSION_B64", "")
+        if session_b64 and not os.path.exists(session_file):
+            import base64
+            logger.info("Instagram: loading session from IG_SESSION_B64 env var...")
+            session_data = base64.b64decode(session_b64).decode()
+            with open(session_file, "w") as f:
+                f.write(session_data)
+            logger.info("Instagram: session file created from env var.")
+        
+        # Priority 2: Use existing session file
         if os.path.exists(session_file):
             ig_client.load_settings(session_file)
             ig_client.login(BOT_INSTAGRAM_USERNAME, BOT_INSTAGRAM_PASSWORD)
             ig_client.dump_settings(session_file)
             logger.info("Instagram: logged in using saved session.")
         else:
-            # Fresh login with a brand-new device fingerprint
+            # Priority 3: Fresh login with a brand-new device fingerprint
             ig_client = _build_fresh_client()
             logger.info("Instagram: attempting fresh login with new device fingerprint...")
             time.sleep(random.uniform(2, 5))  # human-like delay before login
