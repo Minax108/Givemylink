@@ -1,0 +1,22 @@
+# Secrets
+.env
+
+# Instagram session (contains auth tokens)
+ig_session.json
+
+# Lock file
+bot.lock
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+
+# Debug scripts
+debug_*.py
+
+# OS
+.DS_Store
+Thumbs.db
