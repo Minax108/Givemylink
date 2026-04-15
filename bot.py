@@ -106,6 +106,7 @@ ig_client = _build_fresh_client()
 ig_logged_in = False
 _login_fail_count = 0        # Track consecutive login failures
 _last_login_attempt = 0.0    # Timestamp of last login attempt
+_last_login_error = ""       # Capture exact exception string
 
 # Track pending requests: {telegram_user_id: {"reel_url": ..., "timestamp": ...}}
 # Changed to per-user list to allow multiple users simultaneously
@@ -147,7 +148,8 @@ def _get_session_id_from_file(session_file):
 
 def login_instagram():
     """Log in to the bot's dedicated Instagram account with retry logic."""
-    global ig_logged_in, ig_client, _login_fail_count, _last_login_attempt
+    global ig_logged_in, ig_client, _login_fail_count, _last_login_attempt, _last_login_error
+    _last_login_error = ""
     
     # Cooldown: don't retry too fast after failures
     now = time.time()
@@ -155,6 +157,7 @@ def login_instagram():
         cooldown = min(300, 30 * (2 ** (_login_fail_count - 3)))  # exponential backoff, max 5 min
         if now - _last_login_attempt < cooldown:
             logger.warning(f"Instagram login on cooldown ({cooldown}s). Skipping attempt.")
+            _last_login_error = f"On cooldown ({cooldown}s)"
             return
     
     _last_login_attempt = now
@@ -215,6 +218,7 @@ def login_instagram():
         _login_fail_count = 0
     except Exception as e:
         _login_fail_count += 1
+        _last_login_error = str(e)
         logger.error(f"Instagram login failed (attempt #{_login_fail_count}): {e}")
         ig_logged_in = False
 
@@ -760,6 +764,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"❌ Instagram is **disconnected**.\n"
             f"🔄 Login failures: {_login_fail_count}\n"
+            f"⚠️ **Error:** `{_last_login_error}`\n"
             "The bot will try to reconnect on the next request.",
             parse_mode="Markdown"
         )
@@ -801,7 +806,8 @@ async def restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     else:
         await msg.edit_text(
-            "❌ **Restart failed** — Instagram login error.\n"
+            f"❌ **Restart failed** — Instagram login error.\n"
+            f"⚠️ **Exact Error:** `{_last_login_error}`\n"
             "Check credentials and try again.",
             parse_mode="Markdown"
         )
