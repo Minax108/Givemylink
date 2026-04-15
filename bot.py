@@ -144,26 +144,77 @@ def login_instagram():
                 f.write(session_data)
             logger.info("Instagram: session file created from env var.")
         
-        # Priority 2: Use existing session file WITHOUT re-authenticating password
+        # Priority 2: Use existing session file — try DIRECT session load first
+        # (avoids the validation API call that gets blocked on datacenter IPs)
         if os.path.exists(session_file):
             ig_client.load_settings(session_file)
-            # Extract sessionid from the saved settings and login by session only
             settings = ig_client.get_settings()
             session_id = settings.get("authorization_data", {}).get("sessionid", "")
             if not session_id:
                 session_id = settings.get("cookies", {}).get("sessionid", "")
             
             if session_id:
-                logger.info("Instagram: logging in by sessionid (no password needed)...")
-                ig_client.login_by_sessionid(session_id)
-                ig_client.dump_settings(session_file)
-                logger.info(f"Instagram: session login successful as @{ig_client.username}")
-            else:
-                # No sessionid in file, try password login
-                logger.info("Instagram: no sessionid in session file, trying password login...")
-                ig_client.login(BOT_INSTAGRAM_USERNAME, BOT_INSTAGRAM_PASSWORD)
-                ig_client.dump_settings(session_file)
-                logger.info("Instagram: password login succeeded.")
+                # Method A: Direct session injection (no validation API call)
+                # This avoids the reels_tray call that triggers IP blocks
+                try:
+                    logger.info("Instagram: injecting session directly (skip validation)...")
+                    import json as _json
+                    from urllib.parse import unquote
+                    
+                    # Set session cookie directly
+                    decoded_sid = unquote(session_id)
+                    ig_client.authorization_data = settings.get("authorization_data", {})
+                    ig_client.set_settings(settings)
+                    
+                    # Extract user_id from sessionid (format: userid%3A...)
+                    ds_user_id = settings.get("authorization_data", {}).get("ds_user_id", "")
+                    if not ds_user_id and "%" in session_id:
+                        ds_user_id = unquote(session_id).split(":")[0]
+                    elif not ds_user_id:
+                        ds_user_id = session_id.split(":")[0]
+                    
+                    if ds_user_id:
+                        ig_client.user_id = int(ds_user_id)
+                        ig_client.username = BOT_INSTAGRAM_USERNAME
+                    
+                    # Verify with a lightweight API call (user_info is lighter than reels_tray)
+                    try:
+                        user_info = ig_client.account_info()
+                        ig_client.username = user_info.username
+                        ig_client.user_id = user_info.pk
+                        logger.info(f"Instagram: direct session login OK as @{ig_client.username} (id: {ig_client.user_id})")
+                        ig_client.dump_settings(session_file)
+                        ig_logged_in = True
+                        return
+                    except Exception as verify_err:
+                        logger.warning(f"Instagram: session verify via account_info failed: {verify_err}")
+                        # Session might still be valid, just the verify call blocked — try anyway
+                        if ds_user_id:
+                            logger.info(f"Instagram: proceeding with unverified session (user_id: {ds_user_id})")
+                            ig_logged_in = True
+                            return
+                
+                except Exception as direct_err:
+                    logger.warning(f"Instagram: direct session injection failed: {direct_err}")
+                
+                # Method B: Standard login_by_sessionid (may trigger IP block)
+                try:
+                    logger.info("Instagram: trying standard login_by_sessionid...")
+                    ig_client = _build_fresh_client()
+                    ig_client.login_by_sessionid(session_id)
+                    ig_client.dump_settings(session_file)
+                    logger.info(f"Instagram: session login successful as @{ig_client.username}")
+                    ig_logged_in = True
+                    return
+                except Exception as sid_err:
+                    logger.warning(f"Instagram: login_by_sessionid failed: {sid_err}")
+            
+            # Method C: Password login fallback
+            logger.info("Instagram: trying password login...")
+            ig_client = _build_fresh_client()
+            ig_client.login(BOT_INSTAGRAM_USERNAME, BOT_INSTAGRAM_PASSWORD)
+            ig_client.dump_settings(session_file)
+            logger.info("Instagram: password login succeeded.")
         else:
             # Priority 3: Fresh login with a brand-new device fingerprint
             ig_client = _build_fresh_client()
@@ -175,14 +226,17 @@ def login_instagram():
         ig_logged_in = True
     except Exception as e:
         logger.error(f"Instagram login failed: {e}")
-        # Remove stale session so next attempt starts fresh
-        session_file = "ig_session.json"
-        if os.path.exists(session_file):
-            try:
-                os.remove(session_file)
-                logger.info("Removed stale session file for next retry")
-            except OSError:
-                pass
+        # Don't remove session file on first failure — it might work next time
+        # Only remove if it's a password/credential error
+        err_str = str(e).lower()
+        if "password" in err_str or "credential" in err_str:
+            session_file = "ig_session.json"
+            if os.path.exists(session_file):
+                try:
+                    os.remove(session_file)
+                    logger.info("Removed stale session file for next retry")
+                except OSError:
+                    pass
         ig_logged_in = False
 
 
