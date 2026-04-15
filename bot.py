@@ -179,7 +179,17 @@ def login_instagram():
                 logger.error(f"Failed to configure proxy: {pe}")
             ig_client.challenge_code_handler = challenge_code_handler
             # Use raw client for specific session ID so we don't mismatch the User-Agent that created it
-            ig_client.login_by_sessionid(direct_session_id)
+            try:
+                ig_client.login_by_sessionid(direct_session_id)
+            except Exception as login_err:
+                # Capture the raw response text if possible to debug JSONDecodeError
+                err_str = str(login_err)
+                if hasattr(login_err, 'response'):
+                    err_str += f"\nResponse: {login_err.response.text[:200]}"
+                elif hasattr(ig_client, 'public') and ig_client.public.cookies:
+                    err_str += "\nNote: cookies were present."
+                raise Exception(f"Login_by_sessionid failed: {err_str}")
+
             ig_client.dump_settings(session_file)
             logger.info(f"Instagram: session login successful as @{ig_client.username}")
             ig_logged_in = True
