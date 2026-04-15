@@ -38,8 +38,8 @@ BOT_INSTAGRAM_PASSWORD = os.environ.get("BOT_INSTAGRAM_PASSWORD", "")
 DEFAULT_COMMENT = "link"
 
 # STEP 4: How long to wait for ManyChat to DM back (in seconds)
-DM_WAIT_TIME = 7200       # max seconds to wait for a DM reply (2 hours)
-DM_CHECK_INTERVAL = 10   # check DMs every N seconds
+DM_WAIT_TIME = 60       # Just wait 60s for auto-DMs to reply
+DM_CHECK_INTERVAL = 10  # Check DMs every 10s
 
 # STEP 5: Concurrency settings
 MAX_CONCURRENT_IG_CALLS = 3   # max simultaneous Instagram API operations
@@ -532,12 +532,9 @@ async def process_ig_dm_request(user_pk: int, username: str, thread_id: int, ree
     owner_id = None
 
     try:
-        await run_ig(send_dm_reply, thread_id, "Processing your reel link request...")
-
         # Get reel owner
         owner_info = await run_ig(get_reel_owner, shortcode)
         if not owner_info:
-            await run_ig(send_dm_reply, thread_id, "Couldn't find this reel. Check the URL and try again.")
             ig_dm_pending.pop(user_pk, None)
             return
 
@@ -560,12 +557,9 @@ async def process_ig_dm_request(user_pk: int, username: str, thread_id: int, ree
 
         try:
             await run_ig(comment_on_reel, shortcode, final_keyword)
-            await run_ig(send_dm_reply, thread_id,
-                f"Commented '{final_keyword}' on @{owner_username}'s reel. Waiting for the link...")
         except Exception as e:
             waiting_for_owners.discard(owner_id)
             ig_dm_pending.pop(user_pk, None)
-            await run_ig(send_dm_reply, thread_id, f"Couldn't comment on the reel: {str(e)}")
             return
 
         # Poll for DM response from reel owner
@@ -1008,19 +1002,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.error(f"Error polling DMs for user {user_id}: {e}")
 
-        # Update status every ~10 minutes (600 sec) to avoid hitting Telegram rate limits
-        if elapsed > 0 and elapsed % 600 < DM_CHECK_INTERVAL:
-            remaining = DM_WAIT_TIME - elapsed
-            try:
-                await status_msg.edit_text(
-                    f"✅ Followed creator and commented `{final_keyword}` on @{owner_username}'s reel\n"
-                    f"⏳ Waiting for DM response... ({int(remaining/60)}m remaining)\n\n"
-                    f"_(We will message you when it arrives!)_",
-                    parse_mode="Markdown"
-                )
-            except Exception:
-                pass
-                
         await asyncio.sleep(DM_CHECK_INTERVAL)
         elapsed += DM_CHECK_INTERVAL
 
@@ -1030,20 +1011,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Step 5: Send result to user
     if link_found:
-        await status_msg.edit_text(
-            f"✅ **Got it!** Here's your link:\n\n"
-            f"🔗 {link_found}\n\n"
-            f"_(Sent by @{owner_username})_",
+        await update.message.reply_text(
+            f"🔗 {link_found}",
             parse_mode="Markdown"
         )
         logger.info(f"Successfully got link for user {user_id}: {link_found}")
     else:
         await update.message.reply_text(
-            f"⏰ **Timeout** — No DM received from @{owner_username}.\n\n"
-            f"**Possible reasons:**\n"
-            f"• The creator doesn't have an automation set up\n"
-            f"• The keyword `{final_keyword}` might be wrong\n"
-            f"• The automation is broken on their end\n",
+            f"⏰ **Timeout** — No DM received. (waited 60s)",
             parse_mode="Markdown"
         )
 
