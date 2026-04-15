@@ -172,7 +172,7 @@ def login_instagram():
             ig_client = Client()
             ig_client.delay_range = [1, 3]
             try:
-                ig_client.set_proxy("socks5://206.123.156.186:4255")
+                ig_client.set_proxy("socks5://206.123.156.177:4092")
                 logger.info("Instagram: SOCKS5 Proxy configured successfully.")
             except Exception as pe:
                 logger.error(f"Failed to configure proxy: {pe}")
