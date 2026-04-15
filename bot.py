@@ -104,9 +104,12 @@ def _build_fresh_client() -> Client:
 
 ig_client = _build_fresh_client()
 ig_logged_in = False
+_login_fail_count = 0        # Track consecutive login failures
+_last_login_attempt = 0.0    # Timestamp of last login attempt
 
 # Track pending requests: {telegram_user_id: {"reel_url": ..., "timestamp": ...}}
-pending_requests = {}
+# Changed to per-user list to allow multiple users simultaneously
+pending_requests = {}  # {telegram_user_id: {"shortcode": ..., "timestamp": ...}}
 
 # Instagram DM listener state
 ig_dm_pending = {}          # {ig_user_pk: {"shortcode": ..., "thread_id": ..., "timestamp": ...}}
@@ -128,38 +131,75 @@ async def run_ig(func, *args):
         return await loop.run_in_executor(thread_pool, func, *args)
 
 
+def _get_session_id_from_file(session_file):
+    """Extract sessionid from a saved session file without making API calls."""
+    try:
+        import json
+        with open(session_file, "r") as f:
+            settings = json.load(f)
+        sid = settings.get("authorization_data", {}).get("sessionid", "")
+        if not sid:
+            sid = settings.get("cookies", {}).get("sessionid", "")
+        return sid
+    except Exception:
+        return ""
+
+
 def login_instagram():
-    """Log in to the bot's dedicated Instagram account."""
-    global ig_logged_in, ig_client
+    """Log in to the bot's dedicated Instagram account with retry logic."""
+    global ig_logged_in, ig_client, _login_fail_count, _last_login_attempt
+    
+    # Cooldown: don't retry too fast after failures
+    now = time.time()
+    if _login_fail_count >= 3:
+        cooldown = min(300, 30 * (2 ** (_login_fail_count - 3)))  # exponential backoff, max 5 min
+        if now - _last_login_attempt < cooldown:
+            logger.warning(f"Instagram login on cooldown ({cooldown}s). Skipping attempt.")
+            return
+    
+    _last_login_attempt = now
+    
     try:
         session_file = "ig_session.json"
         
-        # Priority 1: Load session from env var
+        # Priority 0: Direct session ID from env var (simplest, highest priority)
+        direct_session_id = os.environ.get("IG_SESSION_ID", "")
+        if direct_session_id:
+            logger.info("Instagram: logging in by IG_SESSION_ID env var...")
+            ig_client = _build_fresh_client()
+            ig_client.login_by_sessionid(direct_session_id)
+            ig_client.dump_settings(session_file)
+            logger.info(f"Instagram: session login successful as @{ig_client.username}")
+            ig_logged_in = True
+            _login_fail_count = 0
+            return
+        
+        # Priority 1: Load session from env var ONLY if no session file exists
         session_b64 = os.environ.get("IG_SESSION_B64", "")
-        if session_b64:
+        if session_b64 and not os.path.exists(session_file):
             import base64
-            logger.info("Instagram: loading session from IG_SESSION_B64 env var...")
+            logger.info("Instagram: creating session file from IG_SESSION_B64 env var...")
             session_data = base64.b64decode(session_b64).decode()
             with open(session_file, "w") as f:
                 f.write(session_data)
             logger.info("Instagram: session file created from env var.")
         
+        # Try loading from session file
         if os.path.exists(session_file):
-            ig_client.load_settings(session_file)
-            settings = ig_client.get_settings()
-            
-            from urllib.parse import unquote
-            session_id = settings.get("authorization_data", {}).get("sessionid", "")
-            if not session_id:
-                session_id = settings.get("cookies", {}).get("sessionid", "")
+            session_id = _get_session_id_from_file(session_file)
             
             if session_id:
                 logger.info("Instagram: logging in by sessionid...")
+                # Build fresh client to avoid stale state
+                ig_client = _build_fresh_client()
                 ig_client.login_by_sessionid(session_id)
                 ig_client.dump_settings(session_file)
                 logger.info(f"Instagram: session login successful as @{ig_client.username}")
                 ig_logged_in = True
+                _login_fail_count = 0
                 return
+            else:
+                logger.warning("Instagram: session file exists but no sessionid found, trying password login")
         
         # Fallback: fresh password login
         ig_client = _build_fresh_client()
@@ -169,17 +209,18 @@ def login_instagram():
         ig_client.dump_settings(session_file)
         logger.info("Instagram: password login succeeded.")
         ig_logged_in = True
+        _login_fail_count = 0
     except Exception as e:
-        logger.error(f"Instagram login failed: {e}")
+        _login_fail_count += 1
+        logger.error(f"Instagram login failed (attempt #{_login_fail_count}): {e}")
         ig_logged_in = False
-
-
-
 
 
 async def ensure_logged_in_async() -> bool:
     """Make sure we're logged into Instagram, reconnect if needed. Thread-safe."""
     global ig_logged_in
+    if ig_logged_in:
+        return True
     async with ig_lock:
         if not ig_logged_in:
             loop = asyncio.get_event_loop()
@@ -220,8 +261,6 @@ def get_best_keyword(shortcode: str) -> str:
         
         if words:
             # Filter out standard stop words just in case
-            stopwords = {"the", "a", "is", "in", "it", "to", "and", "of", "for", "on", "this", "that", "my", "i", "love", "awesome", "great", "send", "me", "plz", "please", "bro"}
-            # keep "send" as keyword actually, don't put send in stopwords.
             stopwords = {"the", "a", "is", "in", "it", "to", "and", "of", "for", "on", "this", "that", "my", "i", "love", "awesome", "great", "plz", "please", "bro"}
             filtered_words = [w for w in words if w not in stopwords and len(w) > 1]
             if filtered_words:
@@ -703,18 +742,21 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    active_users = len(pending_requests)
     if ig_logged_in:
         await update.message.reply_text(
             f"✅ Bot is **online**\n"
             f"📸 Instagram: `@{BOT_INSTAGRAM_USERNAME}`\n"
-            f"📊 Telegram requests: {len(pending_requests)}\n"
+            f"📊 Active Telegram requests: {active_users}\n"
             f"📬 IG DM requests: {len(ig_dm_pending)}\n"
-            f"🔧 Max concurrent: {MAX_CONCURRENT_IG_CALLS}",
+            f"🔧 Max concurrent: {MAX_CONCURRENT_IG_CALLS}\n"
+            f"🔄 Login failures: {_login_fail_count}",
             parse_mode="Markdown"
         )
     else:
         await update.message.reply_text(
-            "❌ Instagram is **disconnected**.\n"
+            f"❌ Instagram is **disconnected**.\n"
+            f"🔄 Login failures: {_login_fail_count}\n"
             "The bot will try to reconnect on the next request.",
             parse_mode="Markdown"
         )
@@ -722,7 +764,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Re-login to Instagram and clear pending requests."""
-    global ig_logged_in, pending_requests, ig_dm_last_check
+    global ig_logged_in, pending_requests, ig_dm_last_check, _login_fail_count
 
     msg = await update.message.reply_text("🔄 Restarting Instagram session...")
 
@@ -731,8 +773,9 @@ async def restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ig_dm_pending.clear()
     ig_dm_processed.clear()
     waiting_for_owners.clear()
+    _login_fail_count = 0  # Reset cooldown
 
-    # Delete old session and re-login
+    # Delete old session and re-login from env var
     async with ig_lock:
         ig_logged_in = False
         session_file = "ig_session.json"
@@ -775,7 +818,11 @@ async def code_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Code `{_challenge_code}` received — applying to login challenge...", parse_mode="Markdown")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Main handler: user sends a reel URL → bot comments → waits for DM → sends link back."""
+    """Main handler: user sends a reel URL → bot comments → waits for DM → sends link back.
+    
+    Multiple users can submit requests simultaneously — each user gets their own
+    async task that runs concurrently.
+    """
     global ig_logged_in
 
     text = update.message.text or ""
@@ -799,14 +846,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Couldn't parse that URL. Make sure it's a valid reel link.")
         return
 
-    # Check if user already has a pending request
+    # Check if user already has a pending request for THIS SAME reel
     if user_id in pending_requests:
-        await update.message.reply_text("⏳ You already have a request in progress. Please wait for it to finish.")
-        return
+        existing = pending_requests[user_id]
+        if existing.get("shortcode") == shortcode:
+            await update.message.reply_text("⏳ You already have a request for this reel in progress. Please wait for it to finish.")
+            return
+        # Allow different reels — they'll queue naturally via the semaphore
 
     # Step 1: Ensure Instagram is connected
     status_msg = await update.message.reply_text(
-        f"⏳ Processing your request...\n\n"
+        f"⏳ Processing your request, {user_name}...\n\n"
         f"🔗 Reel: `...{shortcode}`\n"
         f"🔍 Auto-detecting keyword...",
         parse_mode="Markdown"
@@ -814,8 +864,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not await ensure_logged_in_async():
         await status_msg.edit_text(
-            "❌ Instagram login failed. The bot admin needs to check credentials.\n"
-            "Try again later.",
+            "❌ Instagram login failed. Retrying...\nPlease try again in a minute.",
             parse_mode="Markdown"
         )
         return
@@ -835,6 +884,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"💬 Preparing...",
             parse_mode="Markdown"
         )
+    except instagrapi.exceptions.LoginRequired:
+        ig_logged_in = False
+        await status_msg.edit_text(
+            "⚠️ Instagram session expired. Reconnecting...\nPlease try sending the link again.",
+            parse_mode="Markdown"
+        )
+        await ensure_logged_in_async()
+        return
     except Exception as e:
         await status_msg.edit_text(f"❌ Error finding reel: {str(e)}")
         return
@@ -899,6 +956,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             link_found = await run_ig(check_dms_for_link, owner_id, timestamp_before_comment)
             if link_found:
+                break
+        except instagrapi.exceptions.LoginRequired:
+            ig_logged_in = False
+            logger.warning("Session expired during DM polling, attempting re-login...")
+            if await ensure_logged_in_async():
+                logger.info("Re-login successful, continuing DM polling")
+            else:
+                logger.error("Re-login failed during DM polling")
                 break
         except Exception as e:
             logger.error(f"Error polling DMs for user {user_id}: {e}")
@@ -1038,15 +1103,22 @@ def main():
     # Initialize concurrency primitives
     thread_pool = ThreadPoolExecutor(max_workers=THREAD_POOL_SIZE)
 
-    print("🔐 Logging into Instagram...")
-    login_instagram()
-    if ig_logged_in:
-        print(f"✅ Connected as @{BOT_INSTAGRAM_USERNAME}")
-    else:
-        print("⚠️ Instagram login failed — will retry on first request")
-
     async def post_init(application):
-        """Start the Instagram DM listener background task."""
+        """Initialize async primitives and login to Instagram on the running event loop."""
+        global ig_lock, ig_semaphore
+        ig_lock = asyncio.Lock()
+        ig_semaphore = asyncio.Semaphore(MAX_CONCURRENT_IG_CALLS)
+
+        # Login to Instagram inside the event loop so thread pool works
+        print("🔐 Logging into Instagram...")
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(thread_pool, login_instagram)
+        if ig_logged_in:
+            print(f"✅ Connected as @{BOT_INSTAGRAM_USERNAME}")
+        else:
+            print("⚠️ Instagram login failed — will retry on first request")
+
+        # Start DM listener
         asyncio.create_task(ig_dm_listener())
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).build()
@@ -1066,13 +1138,9 @@ def main():
     print("🛑 Press Ctrl+C to stop")
     print("")
 
+    # Python 3.14 requires explicit event loop creation
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-
-    # Initialize async primitives on the event loop
-    ig_lock = asyncio.Lock()
-    ig_semaphore = asyncio.Semaphore(MAX_CONCURRENT_IG_CALLS)
-
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
