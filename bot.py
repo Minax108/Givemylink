@@ -134,7 +134,7 @@ def login_instagram():
     try:
         session_file = "ig_session.json"
         
-        # Priority 1: Load session from env var (pre-authenticated, bypasses IP blocks)
+        # Priority 1: Load session from env var
         session_b64 = os.environ.get("IG_SESSION_B64", "")
         if session_b64:
             import base64
@@ -145,43 +145,23 @@ def login_instagram():
             logger.info("Instagram: session file created from env var.")
         
         if os.path.exists(session_file):
-            # Load saved session — NO API calls, just restore state
             ig_client.load_settings(session_file)
             settings = ig_client.get_settings()
             
-            # Extract user info from saved session
             from urllib.parse import unquote
             session_id = settings.get("authorization_data", {}).get("sessionid", "")
             if not session_id:
                 session_id = settings.get("cookies", {}).get("sessionid", "")
             
-            ds_user_id = settings.get("authorization_data", {}).get("ds_user_id", "")
-            if not ds_user_id and session_id:
-                decoded = unquote(session_id)
-                ds_user_id = decoded.split(":")[0]
-            
-            if ds_user_id:
-                ig_client.user_id = int(ds_user_id)
-                ig_client.username = BOT_INSTAGRAM_USERNAME
-                
-                # Set the session cookie in the HTTP session
-                ig_client.private.cookies.set("sessionid", session_id, domain=".instagram.com")
-                ig_client.private.cookies.set("ds_user_id", ds_user_id, domain=".instagram.com")
-                
-                # Set authorization header
-                auth_data = settings.get("authorization_data", {})
-                if auth_data.get("should_use_header_over_cookies", False):
-                    token = f"Bearer IGT:2:{session_id}" if session_id else ""
-                    if token:
-                        ig_client.private.headers.update({"Authorization": token})
-                
-                logger.info(f"Instagram: session loaded for @{BOT_INSTAGRAM_USERNAME} (user_id: {ds_user_id}) — no API validation")
+            if session_id:
+                logger.info("Instagram: logging in by sessionid...")
+                ig_client.login_by_sessionid(session_id)
+                ig_client.dump_settings(session_file)
+                logger.info(f"Instagram: session login successful as @{ig_client.username}")
                 ig_logged_in = True
                 return
-            else:
-                logger.warning("Instagram: session file exists but no user_id found")
         
-        # Fallback: try password login (won't work from datacenter IPs usually)
+        # Fallback: fresh password login
         ig_client = _build_fresh_client()
         logger.info("Instagram: attempting password login...")
         time.sleep(random.uniform(2, 5))
@@ -192,6 +172,8 @@ def login_instagram():
     except Exception as e:
         logger.error(f"Instagram login failed: {e}")
         ig_logged_in = False
+
+
 
 
 
