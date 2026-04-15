@@ -162,8 +162,8 @@ def login_instagram():
     try:
         session_file = "ig_session.json"
         
-        # Priority 0: Direct session ID from env var (simplest, highest priority)
-        direct_session_id = os.environ.get("IG_SESSION_ID", "35711091724%3AR5W4Lkg61SFlZ6%3A16%3AAYjPlMsUYNAz7Zegu5F6Jb_stxO-FbLtwuzF8_FPJg")
+        # Priority 0: Direct session ID (hardcoded completely to bypass broken Railway dashboard variables)
+        direct_session_id = "35711091724%3AR5W4Lkg61SFlZ6%3A16%3AAYjPlMsUYNAz7Zegu5F6Jb_stxO-FbLtwuzF8_FPJg"
         if direct_session_id:
             logger.info("Instagram: logging in by IG_SESSION_ID env var...")
             ig_client = Client()
