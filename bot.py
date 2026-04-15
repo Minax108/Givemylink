@@ -1046,34 +1046,13 @@ def _is_pid_alive(pid: int) -> bool:
 
 
 def acquire_lock():
-    """Ensure only one bot instance runs at a time using a lockfile with PID check."""
-    if os.path.exists(LOCK_FILE):
-        try:
-            with open(LOCK_FILE, "r") as f:
-                old_pid = int(f.read().strip())
-            if _is_pid_alive(old_pid):
-                print(f"❌ A process with PID {old_pid} exists.")
-                # In Docker/Railway, PID collisions are common. Ignore lock if env var specifies it.
-                if os.environ.get("RAILWAY_ENVIRONMENT") or os.path.exists("/.dockerenv"):
-                    print("   Running in container/Railway. Ignoring stale lockfile.")
-                else:
-                    print("   Kill it first, or delete bot.lock if it's stale.")
-                    sys.exit(1)
-            else:
-                print(f"🧹 Removing stale lockfile (PID {old_pid} is gone)")
-        except (ValueError, OSError):
-            print("🧹 Removing invalid lockfile")
-
-    with open(LOCK_FILE, "w") as f:
-        f.write(str(os.getpid()))
+    """Lock mechanism disabled. Telegram natively handles concurrency conflicts (HTTP 409)."""
+    pass
 
 
 def release_lock():
-    """Remove the lockfile on clean exit."""
-    try:
-        os.remove(LOCK_FILE)
-    except OSError:
-        pass
+    """Lock mechanism disabled."""
+    pass
 
 
 def main():
