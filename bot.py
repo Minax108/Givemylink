@@ -30,8 +30,8 @@ logger = logging.getLogger(__name__)
 # Credentials are loaded from environment variables for security.
 # Set them in your .env file (locally) or in your cloud provider's dashboard.
 
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-BOT_INSTAGRAM_USERNAME = os.environ.get("BOT_INSTAGRAM_USERNAME", "")
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8015860336:AAGjG4734O8BRRIqhCnHgbwR8-fR0jQ6aX8")
+BOT_INSTAGRAM_USERNAME = os.environ.get("BOT_INSTAGRAM_USERNAME", "geturlink")
 BOT_INSTAGRAM_PASSWORD = os.environ.get("BOT_INSTAGRAM_PASSWORD", "")
 
 # STEP 3: What to comment on the reel (usually "link" but some reels use other keywords)
