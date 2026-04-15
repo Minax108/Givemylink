@@ -171,6 +171,11 @@ def login_instagram():
             logger.info("Instagram: logging in by IG_SESSION_ID env var...")
             ig_client = Client()
             ig_client.delay_range = [1, 3]
+            try:
+                ig_client.set_proxy("socks5://206.123.156.186:4255")
+                logger.info("Instagram: SOCKS5 Proxy configured successfully.")
+            except Exception as pe:
+                logger.error(f"Failed to configure proxy: {pe}")
             ig_client.challenge_code_handler = challenge_code_handler
             # Use raw client for specific session ID so we don't mismatch the User-Agent that created it
             ig_client.login_by_sessionid(direct_session_id)
@@ -218,7 +223,8 @@ def login_instagram():
         _login_fail_count = 0
     except Exception as e:
         _login_fail_count += 1
-        _last_login_error = str(e)
+        import traceback
+        _last_login_error = traceback.format_exc()
         logger.error(f"Instagram login failed (attempt #{_login_fail_count}): {e}")
         ig_logged_in = False
 

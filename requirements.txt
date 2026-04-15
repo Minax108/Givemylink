@@ -2,3 +2,4 @@ python-telegram-bot==21.6
 instagrapi>=2.1.2
 pydantic>=2.10
 python-dotenv>=1.0.0
+PySocks>=1.7.1
