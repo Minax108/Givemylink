@@ -1052,9 +1052,13 @@ def acquire_lock():
             with open(LOCK_FILE, "r") as f:
                 old_pid = int(f.read().strip())
             if _is_pid_alive(old_pid):
-                print(f"❌ Another bot instance is already running (PID {old_pid}).")
-                print("   Kill it first, or delete bot.lock if it's stale.")
-                sys.exit(1)
+                print(f"❌ A process with PID {old_pid} exists.")
+                # In Docker/Railway, PID collisions are common. Ignore lock if env var specifies it.
+                if os.environ.get("RAILWAY_ENVIRONMENT") or os.path.exists("/.dockerenv"):
+                    print("   Running in container/Railway. Ignoring stale lockfile.")
+                else:
+                    print("   Kill it first, or delete bot.lock if it's stale.")
+                    sys.exit(1)
             else:
                 print(f"🧹 Removing stale lockfile (PID {old_pid} is gone)")
         except (ValueError, OSError):
@@ -1080,8 +1084,10 @@ def main():
         missing.append("TELEGRAM_BOT_TOKEN")
     if not BOT_INSTAGRAM_USERNAME or BOT_INSTAGRAM_USERNAME == "YOUR_BOT_INSTAGRAM_USERNAME":
         missing.append("BOT_INSTAGRAM_USERNAME")
-    if not BOT_INSTAGRAM_PASSWORD or BOT_INSTAGRAM_PASSWORD == "YOUR_BOT_INSTAGRAM_PASSWORD":
-        missing.append("BOT_INSTAGRAM_PASSWORD")
+    
+    direct_session_id = os.environ.get("IG_SESSION_ID", "")
+    if not direct_session_id and (not BOT_INSTAGRAM_PASSWORD or BOT_INSTAGRAM_PASSWORD == "YOUR_BOT_INSTAGRAM_PASSWORD"):
+        missing.append("BOT_INSTAGRAM_PASSWORD (or IG_SESSION_ID)")
 
     if missing:
         print("=" * 60)
