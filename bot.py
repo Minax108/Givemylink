@@ -166,7 +166,9 @@ def login_instagram():
         direct_session_id = os.environ.get("IG_SESSION_ID", "35711091724%3AR5W4Lkg61SFlZ6%3A16%3AAYjPlMsUYNAz7Zegu5F6Jb_stxO-FbLtwuzF8_FPJg")
         if direct_session_id:
             logger.info("Instagram: logging in by IG_SESSION_ID env var...")
-            ig_client = _build_fresh_client()
+            ig_client = Client()
+            ig_client.delay_range = [1, 3]
+            # Use raw client for specific session ID so we don't mismatch the User-Agent that created it
             ig_client.login_by_sessionid(direct_session_id)
             ig_client.dump_settings(session_file)
             logger.info(f"Instagram: session login successful as @{ig_client.username}")
