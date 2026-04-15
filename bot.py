@@ -1032,7 +1032,8 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     if isinstance(update, Update) and update.effective_message:
         try:
             await update.effective_message.reply_text(
-                "⚠️ Something went wrong processing your request. Please try again.",
+                f"⚠️ Something went wrong processing your request.\n\n"
+                f"**Error Details:**\n`{str(context.error)[:800]}`",
                 parse_mode="Markdown"
             )
         except Exception:
