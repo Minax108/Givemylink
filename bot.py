@@ -172,8 +172,9 @@ def login_instagram():
             ig_client = Client()
             ig_client.delay_range = [1, 3]
             try:
-                ig_client.set_proxy("socks5://206.123.156.177:4092")
-                logger.info("Instagram: SOCKS5 Proxy configured successfully.")
+                # Using private residential proxy to bypass Datacenter/Railway IP blocks
+                ig_client.set_proxy("http://qcxmvcyr:evrdck2dzymr@31.59.20.176:6754")
+                logger.info("Instagram: Private Proxy configured successfully.")
             except Exception as pe:
                 logger.error(f"Failed to configure proxy: {pe}")
             ig_client.challenge_code_handler = challenge_code_handler
