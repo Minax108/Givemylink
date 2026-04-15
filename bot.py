@@ -697,9 +697,9 @@ async def ig_dm_listener():
                         reel_url = extract_reel_url(link_text)
 
                     # Handle xma (shared content cards — reels, posts, links)
-                    elif item_type in ("xma_media_share", "generic_xma", "xma_link", "xma_reel_share"):
+                    elif item_type in ("xma_media_share", "generic_xma", "xma_link", "xma_reel_share", "xma_clip"):
                         # Log raw xma data for debugging
-                        xma_data = item.get("generic_xma") or item.get("xma_media_share") or item.get("xma_link") or []
+                        xma_data = item.get("generic_xma") or item.get("xma_media_share") or item.get("xma_link") or item.get("xma_clip") or []
                         logger.info(f"[IG DM] XMA data from @{username}: {xma_data}")
 
                         # Search all string values in the XMA structure for Instagram URLs
