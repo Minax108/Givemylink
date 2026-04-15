@@ -168,6 +168,7 @@ def login_instagram():
             logger.info("Instagram: logging in by IG_SESSION_ID env var...")
             ig_client = Client()
             ig_client.delay_range = [1, 3]
+            ig_client.challenge_code_handler = challenge_code_handler
             # Use raw client for specific session ID so we don't mismatch the User-Agent that created it
             ig_client.login_by_sessionid(direct_session_id)
             ig_client.dump_settings(session_file)
