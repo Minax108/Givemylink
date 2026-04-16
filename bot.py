@@ -4,6 +4,7 @@ sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='repla
 sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 
 import os
+import html
 from dotenv import load_dotenv
 load_dotenv()  # Load .env file if present (local dev); no-op in containers
 
@@ -348,6 +349,15 @@ def follow_user(user_id):
     ig_client.user_follow(user_id)
 
 
+def unfollow_user(user_id):
+    """Unfollow an Instagram user."""
+    try:
+        ig_client.user_unfollow(user_id)
+        logger.info(f"Unfollowed creator {user_id}")
+    except Exception as e:
+        logger.error(f"Failed to unfollow creator {user_id}: {e}")
+
+
 def check_dms_for_link(reel_owner_id: int, after_timestamp: float) -> str | None:
     """
     Check Instagram DMs for a new message from the reel owner.
@@ -478,11 +488,7 @@ def fetch_dm_inbox():
                 pt_id = pt.get("thread_id", "")
                 # Auto-approve pending threads
                 try:
-                    ig_client.private_request(
-                        f"direct_v2/threads/{pt_id}/approve/",
-                        data={},
-                        with_signature=False,
-                    )
+                    ig_client.direct_pending_approve(int(pt_id))
                     logger.info(f"[IG DM] Approved pending thread {pt_id}")
                 except Exception as e:
                     logger.warning(f"[IG DM] Could not approve pending thread {pt_id}: {e}")
@@ -527,6 +533,9 @@ async def process_ig_dm_request(user_pk: int, username: str, thread_id: int, ree
     if not shortcode:
         await run_ig(send_dm_reply, thread_id, "Could not parse that URL. Send a valid Instagram reel link.")
         return
+
+    # Send a prompt to the sender so they know the bot is working
+    await run_ig(send_dm_reply, thread_id, "Getting your link as soon as possible... ⏳")
 
     ig_dm_pending[user_pk] = {"shortcode": shortcode, "thread_id": thread_id, "timestamp": time.time()}
     owner_id = None
@@ -579,6 +588,11 @@ async def process_ig_dm_request(user_pk: int, username: str, thread_id: int, ree
         # Cleanup
         waiting_for_owners.discard(owner_id)
         ig_dm_pending.pop(user_pk, None)
+
+        try:
+            await run_ig(unfollow_user, owner_id)
+        except Exception:
+            pass
 
         # Send result
         if link_found:
@@ -737,10 +751,10 @@ async def ig_dm_listener():
                         )
                         break  # one request per user at a time
                     elif item_type == "text" and (item.get("text", "") or "").strip():
-                        # User sent text that's not a reel URL — send help
+                        # User sent text that's not a valid URL — send help
                         try:
                             await run_ig(send_dm_reply, thread_id,
-                                "Hey! Send me an Instagram reel link and I'll get the hidden resource link for you.\n\nYou can either share a reel directly or paste a link like:\nhttps://www.instagram.com/reel/ABC123/")
+                                "Hey! Send me an Instagram post or reel link and I'll get the hidden resource link for you.\n\nYou can either share a reel/post directly or paste a link like:\nhttps://www.instagram.com/reel/ABC123/\nhttps://www.instagram.com/p/ABC123/")
                         except Exception:
                             pass
                         break
@@ -755,49 +769,65 @@ async def ig_dm_listener():
 # ─── TELEGRAM HANDLERS ─────────────────────────────────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "👋 **Welcome to the Reel Link Bot!**\n\n"
-        "Send me any Instagram Reel URL and I'll get the link for you!\n\n"
-        "🔄 **How it works:**\n"
-        "1. You send the reel URL\n"
-        "2. I auto-detect the keyword from comments\n"
-        "3. I follow the creator & comment for you\n"
-        "4. The creator DMs me the link\n"
-        "5. I send the link back to you!\n\n"
-        "📌 **Commands:**\n"
+    admin_id = os.environ.get("ADMIN_TELEGRAM_ID")
+    is_admin = admin_id and str(update.effective_user.id) == admin_id
+
+    commands_text = (
+        "📌 <b>Commands:</b>\n"
         "/start — Show this message\n"
-        "/status — Check bot status\n"
-        "/restart — Re-login to Instagram\n\n"
-        "**Try it:** Just paste a reel URL!",
-        parse_mode="Markdown"
+        "/status — Check bot status"
+    )
+    if is_admin:
+        commands_text += "\n/restart — Re-login to Instagram"
+
+    await update.message.reply_text(
+        f"👋 <b>Welcome to the Instagram Link Bot!</b>\n\n"
+        f"Send me any Instagram Post or Reel URL and I'll get the link for you!\n\n"
+        f"🔄 <b>How it works:</b>\n"
+        f"1. You send the post/reel URL\n"
+        f"2. I auto-detect the keyword from comments\n"
+        f"3. I follow the creator & comment for you\n"
+        f"4. The creator DMs me the link\n"
+        f"5. I send the link back to you!\n\n"
+        f"{commands_text}\n\n"
+        f"<b>Try it:</b> Just paste a link!",
+        parse_mode="HTML"
     )
 
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     active_users = len(pending_requests)
     if ig_logged_in:
+        safe_username = html.escape(str(BOT_INSTAGRAM_USERNAME))
         await update.message.reply_text(
-            f"✅ Bot is **online**\n"
-            f"📸 Instagram: `@{BOT_INSTAGRAM_USERNAME}`\n"
+            f"✅ Bot is <b>online</b>\n"
+            f"📸 Instagram: <code>@{safe_username}</code>\n"
             f"📊 Active Telegram requests: {active_users}\n"
             f"📬 IG DM requests: {len(ig_dm_pending)}\n"
             f"🔧 Max concurrent: {MAX_CONCURRENT_IG_CALLS}\n"
             f"🔄 Login failures: {_login_fail_count}",
-            parse_mode="Markdown"
+            parse_mode="HTML"
         )
     else:
+        safe_error = html.escape(str(_last_login_error))
         await update.message.reply_text(
-            f"❌ Instagram is **disconnected**.\n"
+            f"❌ Instagram is <b>disconnected</b>.\n"
             f"🔄 Login failures: {_login_fail_count}\n"
-            f"⚠️ **Error:** `{_last_login_error}`\n"
+            f"⚠️ <b>Error:</b> <code>{safe_error}</code>\n"
             "The bot will try to reconnect on the next request.",
-            parse_mode="Markdown"
+            parse_mode="HTML"
         )
 
 
 async def restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Re-login to Instagram and clear pending requests."""
     global ig_logged_in, pending_requests, ig_dm_last_check, _login_fail_count
+
+    # Admin check
+    admin_id = os.environ.get("ADMIN_TELEGRAM_ID")
+    if not admin_id or str(update.effective_user.id) != admin_id:
+        await update.message.reply_text("⛔ You are not authorized to use this command.")
+        return
 
     msg = await update.message.reply_text("🔄 Restarting Instagram session...")
 
@@ -823,18 +853,20 @@ async def restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if ig_logged_in:
         ig_dm_last_check = time.time()
+        safe_username = html.escape(str(BOT_INSTAGRAM_USERNAME))
         await msg.edit_text(
-            f"✅ **Restarted successfully!**\n\n"
-            f"📸 Instagram: `@{BOT_INSTAGRAM_USERNAME}`\n"
+            f"✅ <b>Restarted successfully!</b>\n\n"
+            f"📸 Instagram: <code>@{safe_username}</code>\n"
             f"🧹 Pending requests cleared",
-            parse_mode="Markdown"
+            parse_mode="HTML"
         )
     else:
+        safe_error = html.escape(str(_last_login_error))
         await msg.edit_text(
-            f"❌ **Restart failed** — Instagram login error.\n"
-            f"⚠️ **Exact Error:** `{_last_login_error}`\n"
+            f"❌ <b>Restart failed</b> — Instagram login error.\n"
+            f"⚠️ <b>Exact Error:</b> <code>{safe_error}</code>\n"
             "Check credentials and try again.",
-            parse_mode="Markdown"
+            parse_mode="HTML"
         )
 
 
@@ -843,13 +875,14 @@ async def code_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global _challenge_code
     if not context.args:
         await update.message.reply_text(
-            "🔑 **Usage:** `/code 123456`\n\n"
+            "🔑 <b>Usage:</b> <code>/code 123456</code>\n\n"
             "Send the verification code Instagram sent to your email/phone.",
-            parse_mode="Markdown"
+            parse_mode="HTML"
         )
         return
     _challenge_code = context.args[0].strip()
-    await update.message.reply_text(f"✅ Code `{_challenge_code}` received — applying to login challenge...", parse_mode="Markdown")
+    safe_code = html.escape(str(_challenge_code))
+    await update.message.reply_text(f"✅ Code <code>{safe_code}</code> received — applying to login challenge...", parse_mode="HTML")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Main handler: user sends a reel URL → bot comments → waits for DM → sends link back.
@@ -868,38 +901,41 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not url:
         await update.message.reply_text(
-            "🔗 Please send a valid Instagram Reel URL.\n\n"
-            "**Just paste the link** — I'll auto-detect the keyword!\n\n"
-            "Example:\n`https://www.instagram.com/reel/ABC123xyz/`",
-            parse_mode="Markdown"
+            "🔗 Please send a valid Instagram Post or Reel URL.\n\n"
+            "<b>Just paste the link</b> — I'll auto-detect the keyword!\n\n"
+            "Examples:\n<code>https://www.instagram.com/reel/ABC123xyz/</code>\n"
+            "<code>https://www.instagram.com/p/ABC123xyz/</code>",
+            parse_mode="HTML"
         )
         return
 
     shortcode = extract_shortcode(url)
     if not shortcode:
-        await update.message.reply_text("❌ Couldn't parse that URL. Make sure it's a valid reel link.")
+        await update.message.reply_text("❌ Couldn't parse that URL. Make sure it's a valid link.")
         return
 
-    # Check if user already has a pending request for THIS SAME reel
+    # Check if user already has a pending request for THIS SAME link
     if user_id in pending_requests:
         existing = pending_requests[user_id]
         if existing.get("shortcode") == shortcode:
-            await update.message.reply_text("⏳ You already have a request for this reel in progress. Please wait for it to finish.")
+            await update.message.reply_text("⏳ You already have a request for this link in progress. Please wait for it to finish.")
             return
-        # Allow different reels — they'll queue naturally via the semaphore
+        # Allow different links — they'll queue naturally via the semaphore
 
     # Step 1: Ensure Instagram is connected
+    safe_user_name = html.escape(str(user_name))
+    safe_shortcode = html.escape(str(shortcode))
     status_msg = await update.message.reply_text(
-        f"⏳ Processing your request, {user_name}...\n\n"
-        f"🔗 Reel: `...{shortcode}`\n"
+        f"⏳ Processing your request, {safe_user_name}...\n\n"
+        f"🔗 Link: <code>...{safe_shortcode}</code>\n"
         f"🔍 Auto-detecting keyword...",
-        parse_mode="Markdown"
+        parse_mode="HTML"
     )
 
     if not await ensure_logged_in_async():
         await status_msg.edit_text(
             "❌ Instagram login failed. Retrying...\nPlease try again in a minute.",
-            parse_mode="Markdown"
+            parse_mode="HTML"
         )
         return
 
@@ -907,38 +943,41 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         owner_info = await run_ig(get_reel_owner, shortcode)
         if not owner_info:
-            await status_msg.edit_text("❌ Couldn't find information about this reel. Make sure the URL is correct.")
+            await status_msg.edit_text("❌ Couldn't find information about this post/reel. Make sure the URL is correct.")
             return
 
         owner_username = owner_info.get("username", "unknown")
         owner_id = owner_info["user_id"]
 
+        safe_owner = html.escape(str(owner_username))
         await status_msg.edit_text(
-            f"✅ Found reel by **@{owner_username}**\n"
+            f"✅ Found post by <b>@{safe_owner}</b>\n"
             f"💬 Preparing...",
-            parse_mode="Markdown"
+            parse_mode="HTML"
         )
     except instagrapi.exceptions.LoginRequired:
         ig_logged_in = False
         await status_msg.edit_text(
             "⚠️ Instagram session expired. Reconnecting...\nPlease try sending the link again.",
-            parse_mode="Markdown"
+            parse_mode="HTML"
         )
         await ensure_logged_in_async()
         return
     except Exception as e:
-        await status_msg.edit_text(f"❌ Error finding reel: {str(e)}")
+        await status_msg.edit_text(f"❌ Error finding post/reel: {str(e)}")
         return
 
     # Step 2.5: Auto-detect keyword from comments and follow creator
     final_keyword = await run_ig(get_best_keyword, shortcode)
     logger.info(f"Auto-detected keyword for {shortcode}: '{final_keyword}'")
 
+    safe_owner = html.escape(str(owner_username))
+    safe_keyword = html.escape(str(final_keyword))
     await status_msg.edit_text(
-        f"✅ Found reel by **@{owner_username}**\n"
-        f"🔑 Keyword: `{final_keyword}`\n"
+        f"✅ Found post by <b>@{safe_owner}</b>\n"
+        f"🔑 Keyword: <code>{safe_keyword}</code>\n"
         f"💬 Commenting...",
-        parse_mode="Markdown"
+        parse_mode="HTML"
     )
 
     try:
@@ -955,11 +994,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         success = await run_ig(comment_on_reel, shortcode, final_keyword)
 
+        safe_owner = html.escape(str(owner_username))
+        safe_keyword = html.escape(str(final_keyword))
         await status_msg.edit_text(
-            f"✅ Followed creator and commented `{final_keyword}` on @{owner_username}'s reel\n"
+            f"✅ Followed creator and commented <code>{safe_keyword}</code> on @{safe_owner}'s post/reel\n"
             f"⏳ Waiting for the creator to DM the link...\n\n"
-            f"_(I'll send it to you as soon as it arrives!)_",
-            parse_mode="Markdown"
+            f"<i>(I'll send it to you as soon as it arrives!)</i>",
+            parse_mode="HTML"
         )
     except instagrapi.exceptions.LoginRequired:
         ig_logged_in = False
@@ -967,18 +1008,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         waiting_for_owners.discard(owner_id)
         await status_msg.edit_text(
             "⚠️ Instagram session expired. Reconnecting...\nPlease try sending the link again.",
-            parse_mode="Markdown"
+            parse_mode="HTML"
         )
         await ensure_logged_in_async()
         return
     except Exception as e:
         pending_requests.pop(user_id, None)
         waiting_for_owners.discard(owner_id)
+        safe_error = html.escape(str(e))
         await status_msg.edit_text(
-            f"❌ Couldn't comment on the reel.\n\n"
-            f"**Reason:** {str(e)}\n\n"
-            f"The reel might be private, or comments might be disabled.",
-            parse_mode="Markdown"
+            f"❌ Couldn't comment on the post/reel.\n\n"
+            f"<b>Reason:</b> {safe_error}\n\n"
+            f"The post/reel might be private, or comments might be disabled.",
+            parse_mode="HTML"
         )
         return
 
@@ -1009,17 +1051,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pending_requests.pop(user_id, None)
     waiting_for_owners.discard(owner_id)
 
+    try:
+        await run_ig(unfollow_user, owner_id)
+    except Exception:
+        pass
+
     # Step 5: Send result to user
     if link_found:
         await update.message.reply_text(
-            f"🔗 {link_found}",
-            parse_mode="Markdown"
+            f"🔗 {link_found}"
         )
         logger.info(f"Successfully got link for user {user_id}: {link_found}")
     else:
         await update.message.reply_text(
-            f"⏰ **Timeout** — No DM received. (waited 60s)",
-            parse_mode="Markdown"
+            f"⏰ <b>Timeout</b> — No DM received. (waited 60s)",
+            parse_mode="HTML"
         )
 
 
@@ -1031,10 +1077,11 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     # Try to notify the user if possible
     if isinstance(update, Update) and update.effective_message:
         try:
+            safe_error = html.escape(str(context.error)[:800])
             await update.effective_message.reply_text(
                 f"⚠️ Something went wrong processing your request.\n\n"
-                f"**Error Details:**\n`{str(context.error)[:800]}`",
-                parse_mode="Markdown"
+                f"<b>Error Details:</b>\n<code>{safe_error}</code>",
+                parse_mode="HTML"
             )
         except Exception:
             pass
