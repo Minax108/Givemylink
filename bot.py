@@ -50,6 +50,8 @@ THREAD_POOL_SIZE = 10          # thread pool workers for blocking IG calls
 
 import uuid
 import random
+import json
+from instagrapi.exceptions import LoginRequired
 
 # Challenge code storage (set externally via /code Telegram command)
 _challenge_code = None
@@ -71,13 +73,28 @@ def challenge_code_handler(username, choice):
     return ""
 
 
-def _build_fresh_client() -> Client:
-    """Create a new instagrapi Client with a randomized device fingerprint."""
-    cl = Client()
-    cl.delay_range = [2, 5]  # random delay between API calls (looks human)
+# ─── DEVICE FINGERPRINT ───────────────────────────────────────────────────────
+DEVICE_FINGERPRINT_FILE = "device_fingerprint.json"
 
-    # Generate a random Android device fingerprint to avoid IP+device blacklisting
-    cl.set_device({
+
+def _load_or_create_device_fingerprint() -> dict:
+    """Load a persisted device fingerprint or generate and save a new one.
+
+    Keeping a stable fingerprint prevents Instagram from treating every
+    re-login as a brand-new device and invalidating the session.
+    """
+    if os.path.exists(DEVICE_FINGERPRINT_FILE):
+        try:
+            with open(DEVICE_FINGERPRINT_FILE, "r") as f:
+                fp = json.load(f)
+            if fp and "manufacturer" in fp:
+                logger.info("Loaded persisted device fingerprint.")
+                return fp
+        except Exception as e:
+            logger.warning(f"Failed to load device fingerprint: {e}")
+
+    # Generate a new fingerprint and persist it
+    fp = {
         "app_version": "269.0.0.18.75",
         "android_version": random.randint(26, 33),
         "android_release": f"{random.randint(10, 14)}.0",
@@ -88,13 +105,31 @@ def _build_fresh_client() -> Client:
         "model": random.choice(["SM-G965F", "SM-G973F", "ONEPLUS A6013", "Mi A2"]),
         "cpu": random.choice(["qcom", "exynos9810", "samsungexynos9820"]),
         "version_code": "314665256",
-    })
-    # Random user-agent based on above
+    }
+    try:
+        with open(DEVICE_FINGERPRINT_FILE, "w") as f:
+            json.dump(fp, f, indent=2)
+        logger.info("Generated and saved new device fingerprint.")
+    except Exception as e:
+        logger.warning(f"Failed to save device fingerprint: {e}")
+    return fp
+
+
+def _build_fresh_client() -> Client:
+    """Create a new instagrapi Client with a stable persisted device fingerprint."""
+    cl = Client()
+    cl.delay_range = [2, 5]  # random delay between API calls (looks human)
+
+    # Fix 1: Use a stable persisted fingerprint so Instagram does not see a
+    # "new device" on every re-login and invalidate the session.
+    fp = _load_or_create_device_fingerprint()
+    cl.set_device(fp)
     cl.set_user_agent(
-        f"Instagram 269.0.0.18.75 Android ({cl.device.get('android_version', 30)}/{cl.device.get('android_release', '13.0')}; "
-        f"{cl.device.get('dpi', '480dpi')}; {cl.device.get('resolution', '1080x1920')}; "
-        f"{cl.device.get('manufacturer', 'Samsung')}; {cl.device.get('model', 'SM-G965F')}; "
-        f"{cl.device.get('device', 'star2qltechn')}; {cl.device.get('cpu', 'qcom')}; en_US; 314665256)"
+        f"Instagram {fp.get('app_version', '269.0.0.18.75')} Android "
+        f"({fp.get('android_version', 30)}/{fp.get('android_release', '13.0')}; "
+        f"{fp.get('dpi', '480dpi')}; {fp.get('resolution', '1080x1920')}; "
+        f"{fp.get('manufacturer', 'Samsung')}; {fp.get('model', 'SM-G965F')}; "
+        f"{fp.get('device', 'star2qltechn')}; {fp.get('cpu', 'qcom')}; en_US; 314665256)"
     )
 
     # Set the challenge handler
@@ -108,6 +143,10 @@ ig_logged_in = False
 _login_fail_count = 0        # Track consecutive login failures
 _last_login_attempt = 0.0    # Timestamp of last login attempt
 _last_login_error = ""       # Capture exact exception string
+
+# Fix 3: Periodic session save state
+_last_session_save = 0.0
+SESSION_SAVE_INTERVAL = 300  # save session every 5 minutes
 
 # Track pending requests: {telegram_user_id: {"reel_url": ..., "timestamp": ...}}
 # Changed to per-user list to allow multiple users simultaneously
@@ -145,6 +184,19 @@ def _get_session_id_from_file(session_file):
         return sid
     except Exception:
         return ""
+
+
+def _maybe_save_session():
+    """Save the Instagram session periodically to keep the on-disk copy fresh."""
+    global _last_session_save
+    now = time.time()
+    if now - _last_session_save >= SESSION_SAVE_INTERVAL:
+        try:
+            ig_client.dump_settings("ig_session.json")
+            _last_session_save = now
+            logger.info("Session saved periodically.")
+        except Exception as e:
+            logger.warning(f"Periodic session save failed: {e}")
 
 
 def login_instagram():
@@ -211,9 +263,10 @@ def login_instagram():
         except Exception as override_err:
             raise Exception(f"Snapshot hydration failed: {override_err}")
         
-        # Priority 1: Load session from env var ONLY if no session file exists
+        # Fix 4: Always prefer IG_SESSION_B64 env var over whatever is on disk.
+        # A stale file would otherwise shadow a freshly-exported session.
         session_b64 = os.environ.get("IG_SESSION_B64", "")
-        if session_b64 and not os.path.exists(session_file):
+        if session_b64:
             import base64
             logger.info("Instagram: creating session file from IG_SESSION_B64 env var...")
             session_data = base64.b64decode(session_b64).decode()
@@ -284,6 +337,7 @@ def extract_shortcode(url: str) -> str | None:
 
 def get_best_keyword(shortcode: str) -> str:
     """Analyze the reel's top comments to deduce the keyword users are commenting."""
+    global ig_logged_in
     try:
         media_pk = ig_client.media_pk_from_code(shortcode)
         media_id = ig_client.media_id(media_pk)
@@ -311,6 +365,9 @@ def get_best_keyword(shortcode: str) -> str:
                         logger.info(f"Deduced keyword from comments: {keyword} (count: {count})")
                         return keyword
                     
+    except LoginRequired:
+        logger.warning("Session expired during keyword detection — marking for re-login.")
+        ig_logged_in = False
     except Exception as e:
         logger.error(f"Failed to fetch comments to deduce keyword: {e}")
         
@@ -364,6 +421,7 @@ def check_dms_for_link(reel_owner_id: int, after_timestamp: float) -> str | None
     Handles generic_xma (ManyChat cards with CTA buttons), text, and link messages.
     Returns the link/text if found, None otherwise.
     """
+    global ig_logged_in
     try:
         # Check both main inbox and message requests
         threads = ig_client.direct_threads(amount=20)
@@ -455,6 +513,10 @@ def check_dms_for_link(reel_owner_id: int, after_timestamp: float) -> str | None
                                 return urls[0]
 
         return None
+    except LoginRequired:
+        logger.warning("Session expired while checking DMs — marking for re-login.")
+        ig_logged_in = False
+        return None
     except Exception as e:
         logger.error(f"Error checking DMs: {e}")
         return None
@@ -469,6 +531,7 @@ def send_dm_reply(thread_id: int, text: str):
 
 def fetch_dm_inbox():
     """Fetch recent Instagram DM threads with their latest messages (blocking)."""
+    global ig_logged_in
     results = []
     try:
         threads = ig_client.direct_threads(amount=20)
@@ -520,6 +583,11 @@ def fetch_dm_inbox():
                 })
             except Exception:
                 continue
+        # Fix 3: Save session periodically after a successful inbox fetch
+        _maybe_save_session()
+    except LoginRequired:
+        logger.warning("Session expired while fetching DM inbox — marking for re-login.")
+        ig_logged_in = False
     except Exception as e:
         logger.error(f"Error fetching DM inbox: {e}")
     return results
