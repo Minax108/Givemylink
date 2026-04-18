@@ -456,21 +456,20 @@ def check_dms_for_link(reel_owner_id: int, after_timestamp: float) -> str | None
                         if ts < after_timestamp - 86400:
                             continue
 
-                        # Handle generic_xma (ManyChat/automation cards)
-                        if item_type == "generic_xma":
-                            xma_list = item.get("generic_xma", [])
-                            for xma in xma_list:
-                                cta_buttons = xma.get("cta_buttons", [])
+                        # First, if there's a CTA postback button, trigger it
+                        if item_type in ("generic_xma", "xma_link", "xma_media_share", "xma_clip", "xma_reel_share"):
+                            xma_data = item.get(item_type, [])
+                            if isinstance(xma_data, dict):
+                                xma_data = [xma_data]
+                            for xma in (xma_data if isinstance(xma_data, list) else []):
+                                cta_buttons = xma.get("cta_buttons", []) if isinstance(xma, dict) else []
                                 for btn in cta_buttons:
                                     action_url = btn.get("action_url", "")
                                     if action_url and action_url.startswith("http"):
                                         logger.info(f"Found link in CTA button: {action_url}")
                                         return action_url
 
-                                # If CTA has postback but no URL, reply with
-                                # the button title text to trigger ManyChat.
-                                # (The old xma_postback endpoint was deprecated
-                                #  by Instagram and returns 404.)
+                                # If CTA has postback but no URL, reply with button text
                                 if not clicked_postback:
                                     for btn in cta_buttons:
                                         btn_title = btn.get("title", "")
@@ -489,28 +488,35 @@ def check_dms_for_link(reel_owner_id: int, after_timestamp: float) -> str | None
                                             except Exception as e:
                                                 logger.error(f"Failed to reply with button text: {e}")
 
-                                # Also check the title text for URLs
-                                title = xma.get("title_text", "") or ""
-                                urls = re.findall(r'https?://[^\s<>"]+', title)
-                                if urls:
-                                    return urls[0]
+                        # Now search the ENTIRE item dictionary for any URLs (target_url, text, link_url, etc)
+                        def find_any_url(data):
+                            if isinstance(data, str):
+                                urls = re.findall(r'https?://[^\s<>"]+', data)
+                                for u in urls:
+                                    if "fbcdn.net" not in u and "favicon" not in u and "ig_profile_pic" not in u:
+                                        return u
+                                return None
+                            elif isinstance(data, list):
+                                for x in data:
+                                    res = find_any_url(x)
+                                    if res: return res
+                            elif isinstance(data, dict):
+                                # Prioritize exact keys if they contain links
+                                for key in ("target_url", "link_url", "text", "action_url", "title_text", "url"):
+                                    val = data.get(key)
+                                    if val and isinstance(val, str):
+                                        res = find_any_url(val)
+                                        if res: return res
+                                # Then fallback to all values
+                                for val in data.values():
+                                    res = find_any_url(val)
+                                    if res: return res
+                            return None
 
-                        # Handle plain text messages
-                        elif item_type == "text":
-                            text = item.get("text", "")
-                            urls = re.findall(r'https?://[^\s<>"]+', text)
-                            if urls:
-                                logger.info(f"Found link in text message: {urls[0]}")
-                                return urls[0]
-
-                        # Handle link type messages
-                        elif item_type == "link":
-                            link_data = item.get("link", {})
-                            link_url = link_data.get("text", "") or link_data.get("link_url", "")
-                            urls = re.findall(r'https?://[^\s<>"]+', link_url)
-                            if urls:
-                                logger.info(f"Found link in link message: {urls[0]}")
-                                return urls[0]
+                        found_url = find_any_url(item)
+                        if found_url:
+                            logger.info(f"Found link via recursive search in message type {item_type}: {found_url}")
+                            return found_url
 
         return None
     except LoginRequired:
