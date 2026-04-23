@@ -1,0 +1,34 @@
+name: Deploy to AWS EC2
+
+on:
+  push:
+    branches:
+      - main # Or master whatever your default branch is
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Deploy to EC2
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ubuntu
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            # Go to the bot directory
+            cd ~/instagram-link-bot
+            
+            # Pull latest changes from GitHub
+            git pull origin main
+            
+            # Install any new requirements if they changed
+            source venv/bin/activate
+            pip install -r requirements.txt
+            
+            # Restart the bot using systemd (recommended)
+            sudo systemctl restart igbot

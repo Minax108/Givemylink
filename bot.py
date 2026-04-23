@@ -15,6 +15,8 @@ import traceback
 import json
 import html
 import base64
+import subprocess
+import random
 from urllib.parse import parse_qs, unquote, urlparse
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -23,7 +25,13 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 import instagrapi
 from instagrapi import Client
 from collections import Counter
-from pw_engine import pw_intercept_manychat
+import db_cache
+
+try:
+    from pw_engine import pw_intercept_manychat
+except ImportError:
+    pw_intercept_manychat = None
+    # Playwright not available (e.g. on Termux/Android) — ManyChat button fallback disabled
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -47,13 +55,20 @@ DEFAULT_COMMENT = "link"
 
 # STEP 4: How long to wait for ManyChat to DM back (in seconds)
 DM_WAIT_TIME = 7200       # max seconds to wait for a DM reply (2 hours)
-DM_CHECK_INTERVAL = 10   # check DMs every N seconds
+DM_CHECK_INTERVAL = 3    # Faster checking
 
 # STEP 5: Concurrency settings
-MAX_CONCURRENT_IG_CALLS = 3   # max simultaneous Instagram API operations
-THREAD_POOL_SIZE = 10          # thread pool workers for blocking IG calls
+MAX_CONCURRENT_IG_CALLS = 6   # Increased for scaling (more simultaneous processes)
+THREAD_POOL_SIZE = 20          # More threads for handling multiple accounts
 PW_MANYCHAT_TIMEOUT = int(os.environ.get("PW_MANYCHAT_TIMEOUT", "90"))
 IG_PROXY = os.environ.get("IG_PROXY", "")
+ADMIN_USER_IDS = [int(x) for x in os.environ.get("ADMIN_USER_IDS", "").split(",") if x.strip()]
+DEBUG_IG = os.environ.get("DEBUG_IG", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+# STEP 6: Playwright Relay (EC2 server for reliable button clicks)
+# Set this to your EC2 server URL, e.g. "http://13.233.45.67:5123"
+PW_RELAY_URL = os.environ.get("PW_RELAY_URL", "").strip()
+PW_RELAY_API_KEY = os.environ.get("PW_RELAY_API_KEY", "givemylink-pw-secret-2026")
 
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -64,16 +79,104 @@ pending_requests = {}
 
 # Instagram DM listener state
 ig_dm_pending = {}          # {ig_user_pk: {"shortcode": ..., "thread_id": ..., "timestamp": ...}}
-clicked_postback_items = set()
+clicked_postback_items = {}
 ig_dm_processed = set()     # Set of processed DM item_ids to avoid re-processing
 ig_dm_last_check = 0.0      # Timestamp of last DM check
 waiting_for_owners = set()  # Reel owner user IDs we're currently waiting for DM responses
-IG_DM_CHECK_INTERVAL = 15   # How often to check for new IG DM requests (seconds)
+IG_DM_CHECK_INTERVAL = 8   # Faster scan for new requests
+RESTART_DELAY = int(os.environ.get("BOT_RESTART_DELAY", "15"))
+POSTBACK_RETRY_INTERVAL = int(os.environ.get("POSTBACK_RETRY_INTERVAL", "45"))
+MAX_POSTBACK_ATTEMPTS = int(os.environ.get("MAX_POSTBACK_ATTEMPTS", "3"))
+EARLY_MANYCHAT_FALLBACK_SECONDS = int(os.environ.get("EARLY_MANYCHAT_FALLBACK_SECONDS", "90"))
 
 # Concurrency primitives (initialized in main)
 ig_lock = None           # asyncio.Lock — protects login/session state
 ig_semaphore = None      # asyncio.Semaphore — limits concurrent IG API calls
 thread_pool = None       # ThreadPoolExecutor — runs blocking IG calls
+
+# MVP Step 2: Action Queue State
+action_queue = None
+action_results = {}
+action_events = {}
+
+
+def dbg(message: str, *args):
+    """Emit debug logs only when DEBUG_IG is enabled."""
+    if DEBUG_IG:
+        if args:
+            logger.info("[IG DEBUG] " + message, *args)
+        else:
+            logger.info("[IG DEBUG] %s", message)
+
+
+def get_postback_state(item_id: str) -> dict:
+    return clicked_postback_items.get(item_id, {"attempts": 0, "last_attempt": 0.0})
+
+
+def should_retry_postback(item_id: str) -> tuple[bool, int]:
+    state = get_postback_state(item_id)
+    attempts = int(state.get("attempts", 0))
+    last_attempt = float(state.get("last_attempt", 0.0))
+
+    if attempts >= MAX_POSTBACK_ATTEMPTS:
+        return False, attempts
+
+    if attempts == 0 or (time.time() - last_attempt) >= POSTBACK_RETRY_INTERVAL:
+        return True, attempts + 1
+
+    return False, attempts
+
+
+def mark_postback_attempt(item_id: str, button_text: str, payload: str, attempt_number: int):
+    clicked_postback_items[item_id] = {
+        "attempts": attempt_number,
+        "last_attempt": time.time(),
+        "button_text": button_text,
+        "payload": payload,
+    }
+
+
+def send_human_dm_text(client, thread_id: int, text: str, reply_to_item_id: str = None):
+    """Send a DM with human-like pacing and presence signals."""
+    import random
+    import uuid
+
+    try:
+        client.direct_thread_mark_as_seen(thread_id)
+    except Exception:
+        pass
+
+    time.sleep(random.uniform(1.2, 3.8))
+
+    try:
+        client.direct_thread_typing(thread_id, status=True)
+        time.sleep(random.uniform(1.5, 3.6))
+        client.direct_thread_typing(thread_id, status=False)
+    except Exception:
+        pass
+
+    try:
+        if reply_to_item_id:
+            # Send a true reply to the specific item
+            client_context = str(uuid.uuid4())
+            data = {
+                "text": text,
+                "thread_ids": f"[{thread_id}]",
+                "action": "send_item",
+                "client_context": client_context,
+                "reply_to": json.dumps({"item_id": reply_to_item_id})
+            }
+            client.private_request("direct_v2/threads/broadcast/text/", data=data)
+        else:
+            client.direct_answer(thread_id=thread_id, text=text)
+    except Exception as e:
+        logger.warning(f"Failed to send DM text '{text}': {e}")
+        try:
+            # Fallback to normal DM if reply fails
+            if reply_to_item_id:
+                client.direct_answer(thread_id=thread_id, text=text)
+        except:
+            pass
 
 
 async def run_ig(client, func, *args):
@@ -81,6 +184,37 @@ async def run_ig(client, func, *args):
     loop = asyncio.get_event_loop()
     async with ig_semaphore:
         return await loop.run_in_executor(thread_pool, func, client, *args)
+
+
+def create_logged_task(coro, label: str):
+    """Create a background task and log any exception it raises."""
+    task = asyncio.create_task(coro)
+
+    def _done_callback(t: asyncio.Task):
+        try:
+            t.result()
+        except asyncio.CancelledError:
+            logger.info("[%s] cancelled", label)
+        except Exception:
+            logger.exception("[%s] crashed", label)
+
+    task.add_done_callback(_done_callback)
+    return task
+
+
+async def supervise_background_task(label: str, coro_factory, retry_delay: int = RESTART_DELAY):
+    """Keep a background coroutine running even if it crashes."""
+    while True:
+        try:
+            logger.info("[%s] started", label)
+            await coro_factory()
+            logger.warning("[%s] exited; restarting in %ss", label, retry_delay)
+        except asyncio.CancelledError:
+            logger.info("[%s] cancelled", label)
+            raise
+        except Exception:
+            logger.exception("[%s] crashed; restarting in %ss", label, retry_delay)
+        await asyncio.sleep(retry_delay)
 
 async def get_random_client():
     global ig_clients
@@ -93,7 +227,6 @@ async def get_random_client():
     import random
     return random.choice(ig_clients)
 
-
 def login_instagram():
     """Log in to all provided session IDs."""
     global ig_clients
@@ -105,6 +238,7 @@ def login_instagram():
 
     for i, sid in enumerate(session_ids):
         client = Client()
+        client.request_timeout = 45  # Prevent infinite hangs on bad network
         if IG_PROXY:
             client.set_proxy(IG_PROXY)
         try:
@@ -114,7 +248,6 @@ def login_instagram():
         except Exception as e:
             logger.error(f"Instagram client {i+1} login failed: {type(e).__name__}: {e}")
 
-
 async def ensure_logged_in_async() -> bool:
     """Make sure we have at least one logged in Instagram client, reconnect if needed. Thread-safe."""
     global ig_clients
@@ -123,6 +256,63 @@ async def ensure_logged_in_async() -> bool:
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(thread_pool, login_instagram)
     return len(ig_clients) > 0
+
+
+def get_active_ig_usernames() -> list[str]:
+    """Return the usernames of the currently logged-in Instagram clients."""
+    usernames = []
+    for client in ig_clients:
+        username = getattr(client, "username", None)
+        if username:
+            usernames.append(username)
+    return usernames
+
+
+async def retire_client(client, reason: str = "") -> int:
+    """Remove a failing client from the active pool and return remaining count."""
+    global ig_clients
+
+    async with ig_lock:
+        before = len(ig_clients)
+        ig_clients = [c for c in ig_clients if c is not client]
+        after = len(ig_clients)
+
+    if before != after:
+        username = getattr(client, "username", "unknown")
+        if reason:
+            logger.warning("Retired Instagram client @%s: %s", username, reason)
+        else:
+            logger.warning("Retired Instagram client @%s", username)
+
+    return len(ig_clients)
+
+
+async def handle_client_auth_failure(client, reason: str = "") -> bool:
+    """Drop a bad client and re-login only if the pool becomes empty."""
+    remaining = await retire_client(client, reason)
+    if remaining > 0:
+        return True
+    return await restart_async_only()
+
+async def get_next_client():
+    """Get a random Instagram client from the active pool."""
+    global ig_clients
+    
+    if not await ensure_logged_in_async():
+        raise Exception("No Instagram clients available")
+        
+    async with ig_lock:
+        if not ig_clients:
+            raise Exception("No Instagram clients available")
+        
+        client = random.choice(ig_clients)
+        
+        logger.info(
+            "[Rotation] Using random account @%s from %s active sessions",
+            getattr(client, "username", "unknown"),
+            len(ig_clients),
+        )
+        return client
 
 
 def extract_reel_url(text: str) -> str | None:
@@ -191,6 +381,63 @@ def extract_urls_from_text(text: str) -> list[str]:
         cleaned = match.rstrip(".,;:!?)]}")
         urls.append(unwrap_instagram_redirect(cleaned))
     return urls
+
+
+def extract_reel_url_from_shared_item(item: dict) -> str | None:
+    """Extract a reel URL from Instagram shared media item payloads."""
+    candidate_sources = []
+
+    for key in ("media_share", "clip", "reel_share", "story_share", "xma_clip", "xma_media_share", "xma_link", "generic_xma"):
+        value = item.get(key)
+        if value:
+            candidate_sources.append(value)
+
+    if "media" in item and item["media"]:
+        candidate_sources.append(item["media"])
+
+    def _walk(value):
+        if isinstance(value, str):
+            url = extract_reel_url(value)
+            if url:
+                return url
+            try:
+                parsed = json.loads(value)
+                return _walk(parsed)
+            except Exception:
+                return None
+
+        if isinstance(value, list):
+            for child in value:
+                found = _walk(child)
+                if found:
+                    return found
+            return None
+
+        if isinstance(value, dict):
+            for key in ("target_url", "url", "link_url", "text", "serialized_content_ref"):
+                val = value.get(key)
+                if val:
+                    found = _walk(val)
+                    if found:
+                        return found
+
+            shortcode = value.get("code", "")
+            if shortcode:
+                return f"https://www.instagram.com/reel/{shortcode}/"
+
+            for child in value.values():
+                found = _walk(child)
+                if found:
+                    return found
+
+        return None
+
+    for source in candidate_sources:
+        found = _walk(source)
+        if found:
+            return found
+
+    return None
 
 
 def find_urls_deep(value, path: str = "$", found: list[tuple[str, str]] | None = None, seen=None):
@@ -307,28 +554,47 @@ def get_best_keyword(client, shortcode: str) -> str:
 
 
 def comment_on_reel(client, shortcode: str, comment_text: str) -> bool:
-    """Comment on a reel and return True if successful."""
+    """Comment on a reel with heavy stealth and human-like delays."""
     try:
         import random, time
         media_pk = client.media_pk_from_code(shortcode)
         media_id = client.media_id(media_pk)
         
-        # Human-like behavior: Wait randomly
-        delay = random.uniform(3, 8)
-        logger.info(f"Watching reel for {delay:.1f} seconds...")
-        time.sleep(delay)
+        # 1. Simulate "Watching" the reel for a realistic but faster amount of time
+        watch_time = random.uniform(4.5, 12.0)
+        logger.info(f"[Stealth] Watching reel {shortcode} for {watch_time:.1f}s...")
+        time.sleep(watch_time)
         
-        # Human-like behavior: Like the reel before commenting
+        # 2. Simulate "Interacting" like a human (Fetch comments first)
+        try:
+            client.media_comments(media_id, amount=random.randint(3, 8))
+            time.sleep(random.uniform(1.5, 4.0))
+        except Exception:
+            pass
+
+        # 3. Like the reel (Natural engagement)
         try:
              client.media_like(media_id)
-             logger.info(f"Liked reel {shortcode}")
+             logger.info(f"[Stealth] Liked reel {shortcode}")
         except Exception as e:
-             logger.warning(f"Failed to like reel: {e}")
+             logger.warning(f"Failed to like: {e}")
              
-        time.sleep(random.uniform(1, 4))
+        time.sleep(random.uniform(2.0, 5.0))
         
-        client.media_comment(media_id, comment_text)
-        logger.info(f"Commented '{comment_text}' on reel {shortcode}")
+        # 4. Vary the comment text slightly to avoid spam detection
+        variations = [
+            comment_text,
+            comment_text.capitalize(),
+            f"{comment_text}!",
+            f"{comment_text} please",
+            f"{comment_text}!",
+            f"{comment_text} pls",
+            comment_text.lower()
+        ]
+        final_text = random.choice(variations)
+        
+        client.media_comment(media_id, final_text)
+        logger.info(f"[Stealth] Commented '{final_text}' on {shortcode}")
         return True
     except Exception as e:
         logger.error(f"Failed to comment on {shortcode}: {e}")
@@ -355,25 +621,281 @@ def follow_user(client, user_id):
     client.user_follow(user_id)
 
 
+def unfollow_user(client, user_id):
+    """Unfollow an Instagram user."""
+    try:
+        client.user_unfollow(user_id)
+    except Exception as e:
+        logger.warning(f"Could not unfollow user {user_id}: {e}")
+
+
+def trigger_xma_postback(client, thread_id: str, item_id: str, payload: str, button_text: str = ""):
+    """Trigger a ManyChat button click by trying multiple API endpoints.
+    
+    Instagram's postback mechanism is undocumented, so we try several
+    known endpoints that the Instagram app might use internally.
+    """
+    import random
+    import uuid
+
+    success = False
+
+    # Human-like pre-interaction
+    delay = random.uniform(1.5, 4.0)
+    logger.info(f"[Postback] Waiting {delay:.1f}s before clicking '{button_text}'...")
+    time.sleep(delay)
+
+    try:
+        client.direct_thread_mark_as_seen(thread_id)
+    except Exception:
+        pass
+    time.sleep(random.uniform(0.5, 1.2))
+
+    try:
+        client.direct_thread_typing(thread_id, status=True)
+        time.sleep(random.uniform(1.0, 2.5))
+        client.direct_thread_typing(thread_id, status=False)
+    except Exception:
+        pass
+
+    client_context = str(uuid.uuid4())
+    mutation_token = str(uuid.uuid4())
+
+    # --- Endpoint 1: /payload/ (original approach) ---
+    try:
+        resp = client.private_request(
+            f"direct_v2/threads/{thread_id}/items/{item_id}/payload/",
+            data={
+                "payload": payload,
+                "client_context": client_context,
+                "mutation_token": mutation_token,
+            },
+        )
+        logger.info(f"[Postback EP1 /payload/] Success: {resp}")
+        success = True
+    except Exception as e:
+        dbg("[Postback EP1 /payload/] Failed: %s", e)
+
+    time.sleep(random.uniform(1.0, 2.0))
+
+    # --- Endpoint 2: /broadcast/xma_cta_action/ ---
+    if not success:
+        try:
+            resp = client.private_request(
+                f"direct_v2/threads/{thread_id}/broadcast/xma_cta_action/",
+                data={
+                    "thread_ids": f"[{thread_id}]",
+                    "item_id": item_id,
+                    "payload": payload,
+                    "action": "send_item",
+                    "client_context": str(uuid.uuid4()),
+                    "mutation_token": str(uuid.uuid4()),
+                },
+            )
+            logger.info(f"[Postback EP2 /xma_cta_action/] Success: {resp}")
+            success = True
+        except Exception as e:
+            dbg("[Postback EP2 /xma_cta_action/] Failed: %s", e)
+
+    time.sleep(random.uniform(0.5, 1.5))
+
+    # --- Endpoint 3: /payload/ without signature ---
+    if not success:
+        try:
+            resp = client.private_request(
+                f"direct_v2/threads/{thread_id}/items/{item_id}/payload/",
+                data={"payload": payload},
+                with_signature=False,
+            )
+            logger.info(f"[Postback EP3 /payload/ no-sig] Success: {resp}")
+            success = True
+        except Exception as e:
+            dbg("[Postback EP3 /payload/ no-sig] Failed: %s", e)
+
+    # --- Endpoint 4: React to the message (some flows trigger on reactions) ---
+    try:
+        client.private_request(
+            f"direct_v2/threads/{thread_id}/items/{item_id}/reactions/",
+            data={
+                "reaction_status": "created",
+                "reaction_type": "like",
+                "client_context": str(uuid.uuid4()),
+                "node_type": "item",
+                "item_id": item_id,
+            },
+        )
+        logger.info(f"[Postback EP4] Reacted to item {item_id}")
+    except Exception as e:
+        dbg("[Postback EP4 /reactions/] Failed: %s", e)
+
+    if success:
+        logger.info(f"[Postback] At least one endpoint succeeded for '{button_text}'")
+    else:
+        logger.warning(f"[Postback] All API endpoints failed for '{button_text}'")
+
+    return success
+
+
+def _quick_poll_for_link(client, thread_id, requested_shortcode: str = "", max_wait: int = 60, interval: int = 5) -> str | None:
+    """After triggering a postback, immediately poll the thread for a follow-up link.
+    
+    ManyChat typically sends the link within 5-30 seconds of the button click.
+    This inline poll catches it much faster than waiting for the next DM scan cycle.
+    """
+    import time
+    start = time.time()
+    seen_item_ids = set()
+    logger.info(f"[QuickPoll] Polling thread {thread_id} for up to {max_wait}s...")
+
+    while time.time() - start < max_wait:
+        time.sleep(interval)
+        try:
+            result = client.private_request(
+                f"direct_v2/threads/{thread_id}/",
+                params={"visual_message_return_type": "unseen", "direction": "older", "limit": "10"},
+            )
+            items = result.get("thread", {}).get("items", [])
+
+            for item in items:
+                iid = item.get("item_id", "")
+                if iid in seen_item_ids:
+                    continue
+                seen_item_ids.add(iid)
+
+                item_data = to_plain_data(item)
+                item_type = item.get("item_type", "")
+
+                # Check XMA cards for CTA URLs
+                if item_type in ("generic_xma", "xma_link", "xma_share", "xma_media_share"):
+                    xma_list = item.get(item_type, [])
+                    if isinstance(xma_list, dict):
+                        xma_list = [xma_list]
+                    for xma in xma_list:
+                        for btn in xma.get("cta_buttons", []):
+                            action_url = btn.get("action_url", "")
+                            if action_url and action_url.startswith("http"):
+                                found_url = unwrap_instagram_redirect(action_url)
+                                if requested_shortcode and requested_shortcode in found_url and 'instagram.com' in found_url:
+                                    continue
+                                logger.info(f"[QuickPoll] Found link in follow-up CTA: {found_url}")
+                                return found_url
+                        # Check title text for URLs
+                        title = xma.get("title_text", "") or ""
+                        for u in extract_urls_from_text(title):
+                            if requested_shortcode and requested_shortcode in u and 'instagram.com' in u:
+                                continue
+                            logger.info(f"[QuickPoll] Found link in follow-up title: {u}")
+                            return u
+
+                # Check text messages
+                elif item_type == "text":
+                    for u in extract_urls_from_text(item.get("text", "")):
+                        if requested_shortcode and requested_shortcode in u and 'instagram.com' in u:
+                            continue
+                        logger.info(f"[QuickPoll] Found link in follow-up text: {u}")
+                        return u
+
+                # Check link messages
+                elif item_type == "link":
+                    link_data = item.get("link", {})
+                    link_url = link_data.get("text", "") or link_data.get("link_url", "")
+                    for u in extract_urls_from_text(link_url):
+                        if requested_shortcode and requested_shortcode in u and 'instagram.com' in u:
+                            continue
+                        logger.info(f"[QuickPoll] Found link in follow-up link msg: {u}")
+                        return u
+
+                # Deep URL search
+                fallback_url = first_deep_url(item_data, requested_shortcode)
+                if fallback_url:
+                    logger.info(f"[QuickPoll] Found link by deep scan: {fallback_url}")
+                    return fallback_url
+
+        except Exception as e:
+            dbg("[QuickPoll] Error polling thread %s: %s", thread_id, e)
+
+        elapsed = int(time.time() - start)
+        dbg("[QuickPoll] No link yet after %ss", elapsed)
+
+    logger.info(f"[QuickPoll] No follow-up link found after {max_wait}s")
+    return None
+
+
+def call_pw_relay(client, creator_username: str, thread_id: str) -> str | None:
+    """Call the EC2 Playwright relay server to click a postback button via real browser.
+    
+    This is the nuclear option — when API-based postback triggers fail,
+    we delegate to a cloud server running Playwright + Chromium that
+    actually opens Instagram web and clicks the button.
+    """
+    if not PW_RELAY_URL:
+        return None
+
+    try:
+        import base64
+        import requests as http_requests
+
+        # Get the session settings from the instagrapi client
+        settings = client.get_settings()
+        b64_settings = base64.b64encode(json.dumps(settings).encode()).decode()
+
+        payload = {
+            "b64_settings": b64_settings,
+            "creator_username": creator_username,
+            "thread_id": thread_id,
+            "timeout": PW_MANYCHAT_TIMEOUT,
+        }
+
+        logger.info(f"[PW-Relay] Sending click request for @{creator_username} thread={thread_id}")
+        
+        resp = http_requests.post(
+            f"{PW_RELAY_URL}/click",
+            json=payload,
+            headers={"X-API-Key": PW_RELAY_API_KEY},
+            timeout=PW_MANYCHAT_TIMEOUT + 30,  # Give extra time for network
+        )
+
+        if resp.status_code == 200:
+            data = resp.json()
+            link = data.get("link")
+            if link:
+                logger.info(f"[PW-Relay] Got link from Playwright: {link}")
+                return link
+            else:
+                logger.warning(f"[PW-Relay] Server returned no link: {data.get('error', 'unknown')}")
+        else:
+            logger.error(f"[PW-Relay] Server returned HTTP {resp.status_code}: {resp.text[:200]}")
+
+    except Exception as e:
+        logger.error(f"[PW-Relay] Failed to call relay server: {e}")
+
+    return None
+
+
 def check_dms_for_link(client, reel_owner_id: int, after_timestamp: float, requested_shortcode: str = '') -> str | None:
     """
     Check Instagram DMs for a new message from the reel owner.
     Handles generic_xma (ManyChat cards with CTA buttons), text, and link messages.
     Returns the link/text if found, None otherwise.
     """
+    import random
     try:
         # Check both main inbox and message requests
         threads = client.direct_threads(amount=20)
+        dbg("check_dms_for_link scanning %s main threads for owner_id=%s shortcode=%s", len(threads), reel_owner_id, requested_shortcode)
         try:
             pending = client.direct_pending_inbox(amount=20)
             threads.extend(pending)
+            dbg("check_dms_for_link appended %s pending threads", len(pending))
         except Exception as e:
             logger.warning(f"Error checking pending inbox: {e}")
+            dbg("check_dms_for_link pending inbox error: %s", e)
 
         for thread in threads:
             # Check if this thread involves the reel owner
             for user in thread.users:
                 if str(user.pk) == str(reel_owner_id):
+                    dbg("Matched owner_id=%s in thread_id=%s with users=%s", reel_owner_id, thread.id, [(u.pk, u.username) for u in thread.users])
                     # Found the right thread — use raw API to get full message data
                     try:
                         result = client.private_request(
@@ -381,8 +903,10 @@ def check_dms_for_link(client, reel_owner_id: int, after_timestamp: float, reque
                             params={"visual_message_return_type": "unseen", "direction": "older", "seq_id": "40065", "limit": "10"},
                         )
                         items = result.get("thread", {}).get("items", [])
+                        dbg("Loaded %s items from raw thread_id=%s", len(items), thread.id)
                     except Exception as e:
                         logger.error(f"Error fetching raw thread data: {e}")
+                        dbg("Raw thread fetch failed for thread_id=%s: %s", thread.id, e)
                         # Fallback to standard API
                         items = []
 
@@ -414,13 +938,15 @@ def check_dms_for_link(client, reel_owner_id: int, after_timestamp: float, reque
                         for path, url in deep_urls:
                             logger.info(f"[DM inspect] extracted_url path={path} url={url}")
 
-                        # Handle generic_xma (ManyChat/automation cards)
-                        if item_type == "generic_xma":
-                            xma_list = item.get("generic_xma", [])
+                        # Handle generic_xma (ManyChat/automation cards) and other XMA types
+                        if item_type in ("generic_xma", "xma_link", "xma_share", "xma_media_share"):
+                            xma_list = item.get(item_type, [])
                             if isinstance(xma_list, dict):
                                 xma_list = [xma_list]
+                            dbg("Inspecting generic_xma item_id=%s count=%s", item.get("item_id"), len(xma_list))
                             for xma in xma_list:
                                 cta_buttons = xma.get("cta_buttons", [])
+                                dbg("generic_xma title=%s cta_count=%s", xma.get("title_text", ""), len(cta_buttons))
                                 for btn in cta_buttons:
                                     action_url = btn.get("action_url", "")
                                     if action_url and action_url.startswith("http"):
@@ -428,33 +954,126 @@ def check_dms_for_link(client, reel_owner_id: int, after_timestamp: float, reque
                                         # Fix: don't return if the URL is just the exact same reel we requested!
                                         if requested_shortcode and requested_shortcode in found_url and 'instagram.com' in found_url:
                                             logger.info(f"Ignored CTA link because it loops back to requested reel: {found_url}")
+                                            dbg("Ignored CTA url looping back to requested reel: %s", found_url)
                                             continue
                                         logger.info(f"Found link in CTA button: {found_url}")
+                                        dbg("Returning CTA url: %s", found_url)
                                         return found_url
 
-                                # If CTA has postback but no URL, reply with
-                                # the button title text to trigger ManyChat.
-                                # (The old xma_postback endpoint was deprecated
-                                #  by Instagram and returns 404.)
+                                # Multi-strategy button trigger:
+                                # Strategy 1: Try postback API (unreliable but worth trying)
+                                # Strategy 2: Send button text as keyword DM (most reliable)
+                                # Strategy 3: Send common trigger keywords as fallback
                                 item_id = item.get("item_id")
-                                if item_id and item_id not in clicked_postback_items:
-                                    for btn in cta_buttons:
-                                        btn_title = btn.get("title", "")
-                                        platform_token = btn.get("platform_token", {})
-                                        postback = platform_token.get("postback", {})
-                                        payload = postback.get("postback_payload", "")
-                                        if payload and btn_title:
-                                            try:
-                                                logger.info(f"Replying with button text to trigger automation: '{btn_title}'")
-                                                client.direct_answer(
-                                                    thread_id=int(thread.id),
-                                                    text=btn_title,
-                                                )
-                                                clicked_postback_items.add(item_id)
-                                                logger.info("Reply sent, will check for follow-up message next poll")
-                                                break
-                                            except Exception as e:
-                                                logger.error(f"Failed to reply with button text: {e}")
+                                if item_id and cta_buttons:
+                                    should_attempt, attempt_number = should_retry_postback(item_id)
+                                    if not should_attempt:
+                                        state = get_postback_state(item_id)
+                                        dbg(
+                                            "Skipping retry for item_id=%s attempts=%s age=%.1fs",
+                                            item_id,
+                                            state.get("attempts", 0),
+                                            time.time() - float(state.get("last_attempt", 0.0)),
+                                        )
+                                        continue
+
+                                    # Pick the first button with a title
+                                    btn = cta_buttons[0]
+                                    btn_title = btn.get("title", "").strip()
+                                    platform_token = btn.get("platform_token", {})
+                                    if isinstance(platform_token, str):
+                                        try:
+                                            platform_token = json.loads(platform_token)
+                                        except Exception:
+                                            platform_token = {}
+                                    postback = platform_token.get("postback", {})
+                                    payload = postback.get("postback_payload", "")
+
+                                    try:
+                                        # Strategy 1: Try the postback API
+                                        if payload:
+                                            logger.info(f"[Strategy 1] Triggering postback for '{btn_title}' (attempt {attempt_number})")
+                                            trigger_res = trigger_xma_postback(client, str(thread.id), item_id, payload, btn_title)
+                                            if trigger_res:
+                                                logger.info(f"[Strategy 1] Postback API returned success for '{btn_title}'")
+                                            else:
+                                                logger.warning(f"[Strategy 1] Postback API failed for '{btn_title}'")
+                                            
+                                            # Give ManyChat a moment to process
+                                            time.sleep(random.uniform(3.0, 6.0))
+
+                                        # Strategy 2: Send the button text as a keyword DM (as a direct reply to the card)
+                                        # ManyChat bots often listen for exact button text as a fallback trigger.
+                                        if btn_title and attempt_number == 1:
+                                            logger.info(f"[Strategy 2] Replying with button text: '{btn_title}'")
+                                            send_human_dm_text(client, int(thread.id), btn_title, reply_to_item_id=item_id)
+                                            time.sleep(random.uniform(2.0, 4.0))
+
+                                        # Strategy 3: Smarter Keyword Extraction & Fallback
+                                        if attempt_number >= 2:
+                                            keywords_to_try = []
+                                            
+                                            # Look for quoted text or ALL CAPS words in the card's title/subtitle
+                                            title_text = xma.get("title_text", "") or ""
+                                            subtitle_text = xma.get("subtitle_text", "") or ""
+                                            combined_text = f"{title_text} {subtitle_text}"
+                                            
+                                            # 1. Words in quotes (e.g. Reply "YES")
+                                            quotes = re.findall(r'["\']([^"\']+)["\']', combined_text)
+                                            keywords_to_try.extend([q for q in quotes if len(q.split()) <= 3])
+                                            
+                                            # 2. Uppercase emphasis (e.g. comment LINK)
+                                            uppercase = re.findall(r'\b[A-Z]{3,}\b', combined_text)
+                                            keywords_to_try.extend(uppercase)
+                                            
+                                            # 3. Standard fallback dictionary
+                                            common_keywords = ["link", "send", "yes", "access", "get"]
+                                            
+                                            # Find the first extracted keyword that isn't the button title
+                                            extracted = [k for k in keywords_to_try if k.lower() != btn_title.lower()]
+                                            
+                                            if attempt_number == 2 and extracted:
+                                                keyword_to_try = extracted[0]
+                                                logger.info(f"[Strategy 3] Sending extracted keyword: '{keyword_to_try}'")
+                                            else:
+                                                keyword_to_try = common_keywords[(attempt_number) % len(common_keywords)]
+                                                logger.info(f"[Strategy 4] Sending fallback keyword: '{keyword_to_try}'")
+                                                
+                                            time.sleep(random.uniform(5.0, 10.0))
+                                            send_human_dm_text(client, int(thread.id), keyword_to_try, reply_to_item_id=item_id)
+
+                                        mark_postback_attempt(item_id, btn_title, payload, attempt_number)
+                                        logger.info(f"Automation triggered (attempt {attempt_number}), quick-polling for response...")
+
+                                        # CRITICAL: Immediately poll the thread for the follow-up link
+                                        quick_link = _quick_poll_for_link(
+                                            client, str(thread.id),
+                                            requested_shortcode=requested_shortcode,
+                                            max_wait=60 if attempt_number <= 2 else 30,
+                                            interval=5,
+                                        )
+                                        if quick_link:
+                                            logger.info(f"[QuickPoll] Got link after postback trigger: {quick_link}")
+                                            return quick_link
+
+                                        # Strategy 5: PLAYWRIGHT RELAY (nuclear option)
+                                        # If API strategies failed after enough attempts, use the EC2 browser
+                                        if attempt_number >= 2 and PW_RELAY_URL:
+                                            logger.info(f"[Strategy 5] Calling Playwright relay at {PW_RELAY_URL}")
+                                            pw_link = call_pw_relay(
+                                                client=client,
+                                                creator_username=user.username if hasattr(user, 'username') else "",
+                                                thread_id=str(thread.id),
+                                            )
+                                            if pw_link:
+                                                logger.info(f"[Strategy 5] Playwright relay returned link: {pw_link}")
+                                                return pw_link
+                                            else:
+                                                logger.warning(f"[Strategy 5] Playwright relay returned no link")
+
+                                    except Exception as e:
+                                        logger.error(f"Failed to trigger button: {e}")
+                                        mark_postback_attempt(item_id, btn_title, payload, attempt_number)
 
                                 # Also check the title text for URLs
                                 title = xma.get("title_text", "") or ""
@@ -463,6 +1082,7 @@ def check_dms_for_link(client, reel_owner_id: int, after_timestamp: float, reque
                                     for u in urls:
                                         if requested_shortcode and requested_shortcode in u and 'instagram.com' in u:
                                             continue
+                                        dbg("Returning URL from generic_xma title: %s", u)
                                         return u
 
                         # Handle plain text messages
@@ -474,6 +1094,7 @@ def check_dms_for_link(client, reel_owner_id: int, after_timestamp: float, reque
                                     if requested_shortcode and requested_shortcode in u and 'instagram.com' in u:
                                         continue
                                     logger.info(f"Found link in text message: {u}")
+                                    dbg("Returning URL from text item_id=%s url=%s", item.get("item_id"), u)
                                     return u
 
                         # Handle link type messages
@@ -486,11 +1107,13 @@ def check_dms_for_link(client, reel_owner_id: int, after_timestamp: float, reque
                                     if requested_shortcode and requested_shortcode in u and 'instagram.com' in u:
                                         continue
                                     logger.info(f"Found link in link message: {u}")
+                                    dbg("Returning URL from link item_id=%s url=%s", item.get("item_id"), u)
                                     return u
 
                         fallback_url = first_deep_url(item_data, requested_shortcode)
                         if fallback_url:
                             logger.info(f"Found link by recursive DM inspection: {fallback_url}")
+                            dbg("Returning URL from recursive inspection item_id=%s url=%s", item.get("item_id"), fallback_url)
                             return fallback_url
 
         return None
@@ -503,6 +1126,7 @@ def check_dms_for_link(client, reel_owner_id: int, after_timestamp: float, reque
 
 def send_dm_reply(client, thread_id: int, text: str):
     """Send a reply in an Instagram DM thread."""
+    dbg("Sending DM reply to thread %s: %s", thread_id, text[:200] if isinstance(text, str) else text)
     client.direct_answer(thread_id=thread_id, text=text)
 
 
@@ -521,6 +1145,9 @@ def get_dm_thread_id_for_user(client, user_id: int) -> int | None:
 
 async def playwright_manychat_fallback(client, owner_username: str, owner_id: int) -> str | None:
     """Use Instagram Web to click ManyChat buttons and capture webview/chat links."""
+    if pw_intercept_manychat is None:
+        logger.info("[Playwright] pw_engine not available on this platform; skipping fallback")
+        return None
     session_b64 = get_instagram_session_b64(client)
     if not session_b64:
         logger.warning("[Playwright] No IG session snapshot found; skipping fallback")
@@ -549,6 +1176,7 @@ def fetch_dm_inbox(client):
     try:
         threads = client.direct_threads(amount=20)
         logger.info(f"[IG DM] Fetched {len(threads)} main inbox threads")
+        dbg("Main inbox thread ids: %s", [getattr(t, "id", None) for t in threads])
 
         # Fetch pending inbox using raw API to avoid Pydantic validation errors
         try:
@@ -557,8 +1185,10 @@ def fetch_dm_inbox(client):
                 params={"visual_message_return_type": "unseen", "persistentBadging": "true",
                         "is_prefetching": "false"},
             )
+            logger.info(f"[DEBUG] Raw Pending Inbox: {json.dumps(raw_pending, default=str)[:1000]}")
             pending_threads = raw_pending.get("inbox", {}).get("threads", [])
             logger.info(f"[IG DM] Fetched {len(pending_threads)} pending inbox threads (raw)")
+            dbg("Pending inbox thread ids: %s", [pt.get("thread_id") for pt in pending_threads])
 
             for pt in pending_threads:
                 pt_id = pt.get("thread_id", "")
@@ -586,6 +1216,65 @@ def fetch_dm_inbox(client):
         except Exception as e:
             logger.warning(f"[IG DM] Error fetching pending inbox: {e}")
 
+        # Fetch hidden/spam message requests (Instagram's "Hidden Requests" folder)
+        try:
+            raw_spam = client.private_request(
+                "direct_v2/spam_inbox/",
+                params={"visual_message_return_type": "unseen", "persistentBadging": "true",
+                        "is_prefetching": "false"},
+            )
+            logger.info(f"[DEBUG] Raw Spam Inbox: {json.dumps(raw_spam, default=str)[:1000]}")
+            
+            # Try filtered_inbox as another variation
+            raw_filtered = client.private_request(
+                "direct_v2/filtered_inbox/",
+                params={"visual_message_return_type": "unseen", "persistentBadging": "true",
+                        "is_prefetching": "false"},
+            )
+            logger.info(f"[DEBUG] Raw Filtered Inbox: {json.dumps(raw_filtered, default=str)[:1000]}")
+
+            # Also try pending_inbox with folder=spam as a variation
+            raw_pending_spam = client.private_request(
+                "direct_v2/pending_inbox/",
+                params={"visual_message_return_type": "unseen", "persistentBadging": "true",
+                        "is_prefetching": "false", "folder": "spam"},
+            )
+            logger.info(f"[DEBUG] Raw Pending Spam Inbox: {json.dumps(raw_pending_spam, default=str)[:1000]}")
+
+            spam_threads = raw_spam.get("inbox", {}).get("threads", [])
+            if raw_filtered.get("inbox", {}).get("threads"):
+                spam_threads.extend(raw_filtered.get("inbox", {}).get("threads"))
+            if raw_pending_spam.get("inbox", {}).get("threads"):
+                spam_threads.extend(raw_pending_spam.get("inbox", {}).get("threads"))
+                
+            logger.info(f"[IG DM] Fetched {len(spam_threads)} hidden/spam/filtered inbox threads")
+
+            for st in spam_threads:
+                st_id = st.get("thread_id", "")
+                # Auto-approve hidden request threads
+                try:
+                    client.private_request(
+                        f"direct_v2/threads/{st_id}/approve/",
+                        data={},
+                        with_signature=False,
+                    )
+                    logger.info(f"[IG DM] Approved hidden request thread {st_id}")
+                except Exception as e:
+                    logger.warning(f"[IG DM] Could not approve hidden request thread {st_id}: {e}")
+
+                items = st.get("items", [])
+                users = st.get("users", [])
+                user_list = [(u.get("pk", 0), u.get("username", "unknown")) for u in users]
+                if user_list and items:
+                    results.append({
+                        "thread_id": int(st_id),
+                        "users": user_list,
+                        "items": items,
+                    })
+                    dbg("Added hidden/spam thread %s users=%s item_count=%s", st_id, user_list, len(items))
+        except Exception as e:
+            logger.warning(f"[IG DM] Error fetching hidden/spam inbox: {e}")
+
         for thread in threads:
             try:
                 raw = client.private_request(
@@ -598,10 +1287,14 @@ def fetch_dm_inbox(client):
                     "users": [(u.pk, u.username) for u in thread.users],
                     "items": items,
                 })
+                dbg("Added inbox thread %s users=%s item_count=%s", thread.id, [(u.pk, u.username) for u in thread.users], len(items))
             except Exception:
                 continue
     except Exception as e:
         logger.error(f"Error fetching DM inbox: {e}")
+        err_lower = str(e).lower()
+        if any(token in err_lower for token in ("loginrequired", "login_required", "challenge", "checkpoint")):
+            raise
     return results
 
 
@@ -609,27 +1302,32 @@ async def process_ig_dm_request(client, user_pk: int, username: str, thread_id: 
     """Process a reel link request received via Instagram DM."""
     global ig_clients
 
+    dbg("Incoming IG DM request from @%s user_pk=%s thread_id=%s reel_url=%s", username, user_pk, thread_id, reel_url)
+
     shortcode = extract_shortcode(reel_url)
     if not shortcode:
+        dbg("Could not parse shortcode from reel_url=%s", reel_url)
         await run_ig(client, send_dm_reply, thread_id, "Could not parse that URL. Send a valid Instagram reel link.")
         return
 
     ig_dm_pending[user_pk] = {"shortcode": shortcode, "thread_id": thread_id, "timestamp": time.time()}
+    dbg("Marked user_pk=%s as pending with shortcode=%s", user_pk, shortcode)
     owner_id = None
 
     try:
-        await run_ig(client, send_dm_reply, thread_id, "Processing your reel link request...")
+        await run_ig(client, send_dm_reply, thread_id, "Got it, checking the reel now.")
+        dbg("Sent processing reply to @%s", username)
 
         # Get reel owner
         owner_info = await run_ig(client, get_reel_owner, shortcode)
+        dbg("Owner lookup result for shortcode=%s: %s", shortcode, owner_info)
         if not owner_info or "error" in owner_info:
             err = owner_info.get("error", "Unknown") if owner_info else "Unknown"
             err_lower = err.lower()
             if "loginrequired" in err_lower or "login_required" in err_lower or "challenge" in err_lower or "checkpoint" in err_lower:
-                ig_clients.clear()
                 await run_ig(client, send_dm_reply, thread_id, "Instagram session expired. Attempting to reconnect...")
                 ig_dm_pending.pop(user_pk, None)
-                await ensure_logged_in_async()
+                await handle_client_auth_failure(client, err)
                 return
 
             await run_ig(client, send_dm_reply, thread_id, f"Couldn't find this reel. Check the URL and try again. Error: {html.escape(str(err))}")
@@ -638,15 +1336,19 @@ async def process_ig_dm_request(client, user_pk: int, username: str, thread_id: 
 
         owner_username = owner_info.get("username", "unknown")
         owner_id = owner_info["user_id"]
+        dbg("Resolved owner for shortcode=%s -> @%s (%s)", shortcode, owner_username, owner_id)
 
         # Auto-detect keyword
         final_keyword = await run_ig(client, get_best_keyword, shortcode)
         logger.info(f"[IG DM] Keyword for {shortcode}: '{final_keyword}'")
+        dbg("Auto-detected keyword for shortcode=%s: %s", shortcode, final_keyword)
 
         # Follow creator
         try:
             await run_ig(client, follow_user, owner_id)
+            dbg("Followed owner_id=%s (@%s)", owner_id, owner_username)
         except Exception:
+            dbg("Follow failed for owner_id=%s (@%s)", owner_id, owner_username)
             pass
 
         # Comment on reel
@@ -655,8 +1357,9 @@ async def process_ig_dm_request(client, user_pk: int, username: str, thread_id: 
 
         try:
             await run_ig(client, comment_on_reel, shortcode, final_keyword)
+            dbg("Commented on shortcode=%s with keyword=%s", shortcode, final_keyword)
             await run_ig(client, send_dm_reply, thread_id,
-                f"Commented '{final_keyword}' on @{owner_username}'s reel. Waiting for the link...")
+                f"Commented '{final_keyword}' on @{owner_username}'s reel. I’m checking the replies now.")
         except Exception as e:
             waiting_for_owners.discard(owner_id)
             ig_dm_pending.pop(user_pk, None)
@@ -666,20 +1369,43 @@ async def process_ig_dm_request(client, user_pk: int, username: str, thread_id: 
         # Poll for DM response from reel owner
         link_found = None
         elapsed = 0
+        fallback_tried = False
         while elapsed < DM_WAIT_TIME:
             try:
                 link_found = await run_ig(client, check_dms_for_link, owner_id, timestamp_before, shortcode)
+                dbg(
+                    "Poll %s for owner_id=%s returned %s",
+                    elapsed // DM_CHECK_INTERVAL,
+                    owner_id,
+                    link_found,
+                )
                 if link_found:
                     break
             except Exception as e:
                 logger.error(f"[IG DM] Poll error for @{username}: {e}")
+                dbg("Poll error for owner_id=%s: %s", owner_id, e)
+
+            if (
+                not link_found
+                and not fallback_tried
+                and elapsed >= EARLY_MANYCHAT_FALLBACK_SECONDS
+            ):
+                fallback_tried = True
+                await run_ig(client, send_dm_reply, thread_id, "Trying another route to open the DM card...")
+                dbg("Starting early Playwright fallback for owner_id=%s after %ss", owner_id, elapsed)
+                link_found = await playwright_manychat_fallback(client, owner_username, owner_id)
+                dbg("Early Playwright fallback returned %s for owner_id=%s", link_found, owner_id)
+                if link_found:
+                    break
 
             await asyncio.sleep(DM_CHECK_INTERVAL)
             elapsed += DM_CHECK_INTERVAL
 
         if not link_found:
-            await run_ig(client, send_dm_reply, thread_id, "Trying the Instagram Web button flow...")
+            await run_ig(client, send_dm_reply, thread_id, "Still checking the reply path...")
+            dbg("No DM link found for owner_id=%s, starting Playwright fallback", owner_id)
             link_found = await playwright_manychat_fallback(client, owner_username, owner_id)
+            dbg("Playwright fallback returned %s for owner_id=%s", link_found, owner_id)
 
         # Cleanup
         waiting_for_owners.discard(owner_id)
@@ -687,11 +1413,14 @@ async def process_ig_dm_request(client, user_pk: int, username: str, thread_id: 
 
         # Send result
         if link_found:
+            db_cache.save_cached_link(shortcode, link_found)
             await run_ig(client, send_dm_reply, thread_id, f"Here's your link:\n\n{link_found}")
             logger.info(f"[IG DM] Got link for @{username}: {link_found}")
+            dbg("Sent final link reply to @%s: %s", username, link_found)
         else:
             await run_ig(client, send_dm_reply, thread_id,
-                f"No response from @{owner_username}. They might not have automation set up, or the keyword '{final_keyword}' was wrong.")
+                f"I couldn't catch a reply from @{owner_username} yet. If it shows up, I'll pick it up automatically.")
+            dbg("No link found for owner_id=%s (@%s)", owner_id, owner_username)
 
     except Exception as e:
         logger.error(f"[IG DM] Error processing request from @{username}: {e}")
@@ -711,6 +1440,7 @@ async def ig_dm_listener():
     await asyncio.sleep(20)  # let login settle
     first_scan = True
     logger.info("Instagram DM listener started")
+    dbg("IG DM listener entered main loop")
 
     while True:
         try:
@@ -731,8 +1461,13 @@ async def ig_dm_listener():
                     all_threads.extend(tds)
                 except Exception as e:
                     logger.error(f"[IG DM] Client fetch failed: {e}")
+                    dbg("Client fetch failed for @%s: %s", getattr(client, "username", "unknown"), e)
+                    err_lower = str(e).lower()
+                    if any(token in err_lower for token in ("loginrequired", "login_required", "challenge", "checkpoint")):
+                        await handle_client_auth_failure(client, str(e))
             threads_data = all_threads
             logger.info(f"[IG DM] Scanned {len(threads_data)} threads across {len(ig_clients)} clients, ig_dm_last_check={ig_dm_last_check:.0f}")
+            dbg("Listener scan complete: threads=%s clients=%s", len(threads_data), len(ig_clients))
 
             for td in threads_data:
                 thread_id = td["thread_id"]
@@ -749,6 +1484,7 @@ async def ig_dm_listener():
                 items = td["items"]
                 if items:
                     logger.info(f"[IG DM] Thread with @{username} ({user_pk}): {len(items)} items")
+                    dbg("Inspecting thread_id=%s @%s user_pk=%s item_count=%s", thread_id, username, user_pk, len(items))
 
                 for idx, item in enumerate(items):
                     item_id = item.get("item_id", "")
@@ -771,28 +1507,16 @@ async def ig_dm_listener():
 
                     item_type = item.get("item_type", "")
                     logger.info(f"[IG DM] Message from @{username}: type={item_type}, item_id={item_id}")
+                    dbg("Item detail thread_id=%s item_id=%s type=%s sender=%s keys=%s", thread_id, item_id, item_type, sender, list(item.keys()))
 
                     reel_url = None
 
                     # Handle shared reels (when user taps share button on a reel)
-                    if item_type in ("media_share", "clip", "felix_share", "reel_share", "story_share"):
-                        media = item.get("media_share") or item.get("clip", {}).get("clip") or item.get("felix_share_reel_media") or {}
-                        if not media and "media" in item:
-                            media = item["media"]
-                        shortcode = media.get("code", "")
-                        if shortcode:
-                            reel_url = f"https://www.instagram.com/reel/{shortcode}/"
+                    if item_type in ("media_share", "clip", "felix_share", "reel_share", "story_share", "xma_clip", "xma_reel_share", "xma_media_share"):
+                        reel_url = extract_reel_url_from_shared_item(item)
+                        if reel_url:
                             logger.info(f"[IG DM] Extracted reel from share: {reel_url}")
-                        else:
-                            # Try to find it in nested structures
-                            for key in ("media_share", "clip", "felix_share_reel_media", "reel_share"):
-                                nested = item.get(key, {})
-                                if isinstance(nested, dict):
-                                    sc = nested.get("code", "")
-                                    if sc:
-                                        reel_url = f"https://www.instagram.com/reel/{sc}/"
-                                        logger.info(f"[IG DM] Extracted reel from {key}: {reel_url}")
-                                        break
+                            dbg("Shared media item resolved to reel_url=%s for item_type=%s", reel_url, item_type)
 
                     # Handle text messages with URLs
                     elif item_type == "text":
@@ -806,7 +1530,7 @@ async def ig_dm_listener():
                         reel_url = extract_reel_url(link_text)
 
                     # Handle xma (shared content cards — reels, posts, links)
-                    elif item_type in ("xma_media_share", "generic_xma", "xma_link", "xma_reel_share"):
+                    elif item_type in ("generic_xma", "xma_link"):
                         # Log raw xma data for debugging
                         xma_data = item.get("generic_xma") or item.get("xma_media_share") or item.get("xma_link") or []
                         logger.info(f"[IG DM] XMA data from @{username}: {xma_data}")
@@ -847,8 +1571,10 @@ async def ig_dm_listener():
 
                     if reel_url:
                         logger.info(f"[IG DM] New request from @{username}: {reel_url}")
-                        asyncio.create_task(
-                            process_ig_dm_request(td['client'], user_pk, username, thread_id, reel_url)
+                        dbg("Detected reel request from @%s -> %s", username, reel_url)
+                        create_logged_task(
+                            process_ig_dm_request(td['client'], user_pk, username, thread_id, reel_url),
+                            f"IG DM request @{username}",
                         )
                         break  # one request per user at a time
                     elif item_type == "text" and (item.get("text", "") or "").strip():
@@ -865,6 +1591,60 @@ async def ig_dm_listener():
 
         first_scan = False
         await asyncio.sleep(IG_DM_CHECK_INTERVAL)
+
+
+async def action_queue_worker():
+    """Background task that pulls from action_queue and paces out Instagram comments."""
+    logger.info("Action Queue Worker started")
+    while True:
+        try:
+            if action_queue is None:
+                await asyncio.sleep(1)
+                continue
+                
+            task = await action_queue.get()
+            shortcode = task["shortcode"]
+            client = task["client"]
+            owner_id = task["owner_id"]
+            final_keyword = task["final_keyword"]
+            status_msg = task["status_msg"]
+
+            # Wait a random human-like delay before commenting
+            # if the queue was backed up, pacing happens naturally
+            delay = random.uniform(15.0, 45.0)
+            
+            try:
+                await status_msg.edit_text(
+                    f"🚶‍♂️ <b>Human Pacing...</b> Waiting {int(delay)}s to avoid spam filters.",
+                    parse_mode="HTML"
+                )
+            except Exception:
+                pass
+                
+            await asyncio.sleep(delay)
+
+            try:
+                await run_ig(client, follow_user, owner_id)
+            except Exception:
+                pass
+                
+            success = False
+            error_msg = ""
+            try:
+                success = await run_ig(client, comment_on_reel, shortcode, final_keyword)
+            except Exception as e:
+                error_msg = str(e)
+                
+            action_results[shortcode] = {"success": success, "error": error_msg}
+            
+            # Unblock handle_message
+            if shortcode in action_events:
+                action_events[shortcode].set()
+                
+            action_queue.task_done()
+        except Exception as e:
+            logger.error(f"Action Queue Worker error: {e}")
+            await asyncio.sleep(5)
 
 
 # ─── TELEGRAM HANDLERS ─────────────────────────────────────────────────────────
@@ -889,10 +1669,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    active_usernames = get_active_ig_usernames()
     if len(ig_clients) > 0:
         await update.message.reply_text(
             f"✅ Bot is <b>online</b>\n"
-            f"📸 Instagram: <code>@{BOT_INSTAGRAM_USERNAME}</code>\n"
+            f"📸 Instagram: <code>@{', @'.join(active_usernames) if active_usernames else BOT_INSTAGRAM_USERNAME}</code>\n"
+            f"🧪 IG debug: <b>{'on' if DEBUG_IG else 'off'}</b>\n"
             f"📊 Telegram requests: {len(pending_requests)}\n"
             f"📬 IG DM requests: {len(ig_dm_pending)}\n"
             f"🔧 Max concurrent: {MAX_CONCURRENT_IG_CALLS}",
@@ -909,6 +1691,11 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Re-login to Instagram and clear pending requests."""
     global ig_clients, pending_requests, ig_dm_last_check
+    
+    user_id = update.effective_user.id
+    if ADMIN_USER_IDS and user_id not in ADMIN_USER_IDS:
+        await update.message.reply_text("⛔ You are not authorized to use this command.")
+        return
 
     msg = await update.message.reply_text("🔄 Restarting Instagram session...")
 
@@ -916,6 +1703,7 @@ async def restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pending_requests.clear()
     ig_dm_pending.clear()
     ig_dm_processed.clear()
+    clicked_postback_items.clear()
     waiting_for_owners.clear()
 
     # Delete old session and re-login
@@ -947,6 +1735,68 @@ async def restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+async def restart_async_only() -> bool:
+    """Restart Instagram state without requiring a Telegram update object."""
+    global ig_clients, ig_dm_last_check
+
+    async with ig_lock:
+        ig_clients.clear()
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(thread_pool, login_instagram)
+
+    if len(ig_clients) > 0:
+        ig_dm_last_check = time.time()
+        logger.info("Instagram reconnected successfully")
+        return True
+
+    logger.warning("Instagram reconnect failed")
+    return False
+
+
+async def set_session_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Update the IG_SESSION_IDS in the .env file directly from Telegram."""
+    user_id = update.effective_user.id
+    if ADMIN_USER_IDS and user_id not in ADMIN_USER_IDS:
+        await update.message.reply_text("⛔ You are not authorized to use this command.")
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "⚠️ Please provide a session ID.\n"
+            "Usage: `/set_session <new_session_id>`",
+            parse_mode="Markdown"
+        )
+        return
+
+    new_session = " ".join(context.args).strip()
+    
+    # Update .env file locally
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    env_lines = []
+    if os.path.exists(env_path):
+        with open(env_path, "r") as f:
+            env_lines = f.readlines()
+            
+    found = False
+    for i, line in enumerate(env_lines):
+        if line.startswith("IG_SESSION_IDS=") or line.startswith("IG_SESSION_ID="):
+            env_lines[i] = f"IG_SESSION_IDS={new_session}\n"
+            found = True
+            
+    if not found:
+        env_lines.append(f"\nIG_SESSION_IDS={new_session}\n")
+        
+    with open(env_path, "w") as f:
+        f.writelines(env_lines)
+        
+    # Update process environment
+    os.environ["IG_SESSION_IDS"] = new_session
+
+    await update.message.reply_text("✅ Session ID saved! Restarting...")
+    # Trigger restart to apply new session
+    await restart(update, context)
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Main handler: user sends a reel URL → bot comments → waits for DM → sends link back."""
     global ig_clients
@@ -972,22 +1822,32 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Couldn't parse that URL. Make sure it's a valid reel link.")
         return
 
+    # MVP Step 1: Check Database Cache First
+    cached_link = db_cache.get_cached_link(shortcode)
+    if cached_link:
+        await update.message.reply_text(
+            f"⚡ <b>Instant Delivery!</b> I found this link in my cache:\n\n"
+            f"🔗 {cached_link}\n\n"
+            f"<i>(Saved you the wait!)</i>",
+            parse_mode="HTML"
+        )
+        db_cache.track_user_request(user_id, user_name)
+        return
+
     # Check if user already has a pending request
     if user_id in pending_requests:
         await update.message.reply_text("⏳ You already have a request in progress. Please wait for it to finish.")
         return
 
-    # Step 1: Ensure Instagram is connected
+    # Step 1: Get next available client in rotation
     try:
-        client = await get_random_client()
+        client = await get_next_client()
     except Exception as e:
-        await update.message.reply_text("❌ No Instagram clients available.")
+        await update.message.reply_text(f"❌ Error: {e}")
         return
         
     status_msg = await update.message.reply_text(
-        f"⏳ Processing your request...\n\n"
-        f"🔗 Reel: <code>...{shortcode}</code>\n"
-        f"🔍 Auto-detecting keyword...",
+        f"⏳ <b>Checking the reel...</b>",
         parse_mode="HTML"
     )
 
@@ -1006,12 +1866,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             err = owner_info.get("error", "Unknown") if owner_info else "Unknown"
             err_lower = err.lower()
             if "loginrequired" in err_lower or "login_required" in err_lower or "challenge" in err_lower or "checkpoint" in err_lower:
-                ig_clients.clear()
                 await status_msg.edit_text(
                     "⚠️ Instagram session expired or IP blocked. Reconnecting...\nPlease try sending the link again.",
                     parse_mode="HTML"
                 )
-                await ensure_logged_in_async()
+                await handle_client_auth_failure(client, err)
                 return
 
             await status_msg.edit_text(
@@ -1023,70 +1882,81 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         owner_username = owner_info.get("username", "unknown")
         owner_id = owner_info["user_id"]
 
-        await status_msg.edit_text(
-            f"✅ Found reel by <b>@{owner_username}</b>\n"
-            f"💬 Preparing...",
-            parse_mode="HTML"
-        )
     except Exception as e:
-        await status_msg.edit_text(f"❌ Error finding reel: {html.escape(str(e))}")
+        await status_msg.edit_text(f"❌ Error: {html.escape(str(e))}")
         return
 
-    # Step 2.5: Auto-detect keyword from comments and follow creator
+    # Step 2.5: Auto-detect keyword from comments
     final_keyword = await run_ig(client, get_best_keyword, shortcode)
     logger.info(f"Auto-detected keyword for {shortcode}: '{final_keyword}'")
-
-    await status_msg.edit_text(
-        f"✅ Found reel by <b>@{owner_username}</b>\n"
-        f"🔑 Keyword: <code>{final_keyword}</code>\n"
-        f"💬 Commenting...",
-        parse_mode="HTML"
-    )
-
+    
+    # --- MVP Step 2: Queue the Action ---
+    global action_queue
+    queue_pos = action_queue.qsize() + 1
+    
     try:
-        await run_ig(client, follow_user, owner_id)
-        logger.info(f"Followed creator {owner_id}")
-    except Exception as e:
-        logger.info(f"Could not follow user {owner_id} (or already following): {e}")
+        await status_msg.edit_text(
+            f"📝 <b>Added to Action Queue</b> (Position: #{queue_pos})\n\n"
+            f"I'll comment on this reel shortly using the keyword: '<code>{final_keyword}</code>'.",
+            parse_mode="HTML"
+        )
+    except Exception:
+        pass
 
-    # Step 3: Comment on the reel
+    action_events[shortcode] = asyncio.Event()
+    
+    await action_queue.put({
+        "shortcode": shortcode,
+        "client": client,
+        "owner_id": owner_id,
+        "final_keyword": final_keyword,
+        "status_msg": status_msg
+    })
+    
+    # Wait for the worker to process it
+    await action_events[shortcode].wait()
+    
+    result = action_results.get(shortcode, {"success": False, "error": "Unknown"})
+    
+    # Cleanup events
+    action_events.pop(shortcode, None)
+    action_results.pop(shortcode, None)
+    
+    if not result["success"]:
+        pending_requests.pop(user_id, None)
+        waiting_for_owners.discard(owner_id)
+        
+        err = result["error"]
+        if "loginrequired" in err.lower() or "challenge" in err.lower():
+            await status_msg.edit_text(
+                "⚠️ Instagram session expired. Reconnecting...\nPlease try sending the link again.",
+                parse_mode="HTML"
+            )
+            await handle_client_auth_failure(client, err)
+        else:
+            await status_msg.edit_text(
+                f"❌ Couldn't comment on the reel.\n\n"
+                f"<b>Reason:</b> {html.escape(err)}\n\n"
+                f"The reel might be private, or comments might be disabled.",
+                parse_mode="HTML"
+            )
+        return
+        
+    # Comment succeeded!
     waiting_for_owners.add(owner_id)
     timestamp_before_comment = time.time()
     pending_requests[user_id] = {"shortcode": shortcode, "timestamp": timestamp_before_comment}
-
-    try:
-        success = await run_ig(client, comment_on_reel, shortcode, final_keyword)
-
-        await status_msg.edit_text(
-            f"✅ Followed creator and commented <code>{final_keyword}</code> on @{owner_username}'s reel\n"
-            f"⏳ Waiting for the creator to DM the link...\n\n"
-            f"<i>(I'll send it to you as soon as it arrives!)</i>",
-            parse_mode="HTML"
-        )
-    except instagrapi.exceptions.LoginRequired:
-        ig_clients.clear()
-        pending_requests.pop(user_id, None)
-        waiting_for_owners.discard(owner_id)
-        await status_msg.edit_text(
-            "⚠️ Instagram session expired. Reconnecting...\nPlease try sending the link again.",
-            parse_mode="HTML"
-        )
-        await ensure_logged_in_async()
-        return
-    except Exception as e:
-        pending_requests.pop(user_id, None)
-        waiting_for_owners.discard(owner_id)
-        await status_msg.edit_text(
-            f"❌ Couldn't comment on the reel.\n\n"
-            f"<b>Reason:</b> {html.escape(str(e))}\n\n"
-            f"The reel might be private, or comments might be disabled.",
-            parse_mode="HTML"
-        )
-        return
+    
+    await status_msg.edit_text(
+        f"✅ <b>Done!</b> I’ve left the comment and I’m watching @{owner_username}.",
+        parse_mode="HTML"
+    )
+    # --- End MVP Step 2 Queueing ---
 
     # Step 4: Poll DMs for the response link
     link_found = None
     elapsed = 0
+    fallback_tried = False
 
     while elapsed < DM_WAIT_TIME:
         try:
@@ -1096,14 +1966,30 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.error(f"Error polling DMs for user {user_id}: {e}")
 
-        # Update status every ~10 minutes (600 sec) to avoid hitting Telegram rate limits
-        if elapsed > 0 and elapsed % 600 < DM_CHECK_INTERVAL:
-            remaining = DM_WAIT_TIME - elapsed
+        if (
+            not link_found
+            and not fallback_tried
+            and elapsed >= EARLY_MANYCHAT_FALLBACK_SECONDS
+        ):
+            fallback_tried = True
             try:
                 await status_msg.edit_text(
-                    f"✅ Followed creator and commented <code>{final_keyword}</code> on @{owner_username}'s reel\n"
-                    f"⏳ Waiting for DM response... ({int(remaining/60)}m remaining)\n\n"
-                    f"<i>(We will message you when it arrives!)</i>",
+                    f"I’m trying another route with @{owner_username} now...",
+                    parse_mode="HTML"
+                )
+            except Exception:
+                pass
+            link_found = await playwright_manychat_fallback(client, owner_username, owner_id)
+            if link_found:
+                break
+
+        # Update status every ~10 minutes (600 sec) to avoid hitting Telegram rate limits
+        if elapsed > 0 and elapsed % 600 < DM_CHECK_INTERVAL:
+            try:
+                await status_msg.edit_text(
+                    f"✅ Commented <code>{final_keyword}</code> on @{owner_username}'s reel\n"
+                    f"⏳ Still checking the replies...\n\n"
+                    f"<i>I’ll send it over when it shows up.</i>",
                     parse_mode="HTML"
                 )
             except Exception:
@@ -1112,22 +1998,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await asyncio.sleep(DM_CHECK_INTERVAL)
         elapsed += DM_CHECK_INTERVAL
 
-    if not link_found:
-        try:
-            await status_msg.edit_text(
-                f"Still waiting on @{owner_username}. Trying the Instagram Web button flow...",
-                parse_mode="HTML"
-            )
-        except Exception:
-            pass
+        if not link_found:
+            try:
+                await status_msg.edit_text(
+                    f"Still checking @{owner_username}. I’m trying another reply path now...",
+                    parse_mode="HTML"
+                )
+            except Exception:
+                pass
         link_found = await playwright_manychat_fallback(client, owner_username, owner_id)
 
     # Clean up pending request
     pending_requests.pop(user_id, None)
     waiting_for_owners.discard(owner_id)
 
-    # Step 5: Send result to user
+    # Step 5: Send result to user and unfollow creator
     if link_found:
+        db_cache.save_cached_link(shortcode, link_found)
         await status_msg.edit_text(
             f"✅ <b>Got it!</b> Here's your link:\n\n"
             f"🔗 {link_found}\n\n"
@@ -1135,15 +2022,49 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML"
         )
         logger.info(f"Successfully got link for user {user_id}: {link_found}")
-    else:
-        await update.message.reply_text(
-            f"⏰ <b>Timeout</b> — No DM received from @{owner_username}.\n\n"
-            f"<b>Possible reasons:</b>\n"
-            f"• The creator doesn't have an automation set up\n"
-            f"• The keyword <code>{final_keyword}</code> might be wrong\n"
-            f"• The automation is broken on their end\n",
-            parse_mode="HTML"
-        )
+
+        # Unfollow the creator after a long delay (2-5 mins) to look natural
+        try:
+            unfollow_delay = random.uniform(120, 300)
+            logger.info(f"[Stealth] Will unfollow creator {owner_id} in {unfollow_delay:.1f}s")
+            
+            async def delayed_unfollow(cid, uid, delay):
+                await asyncio.sleep(delay)
+                try:
+                    await run_ig(cid, unfollow_user, uid)
+                    logger.info(f"[Stealth] Unfollowed creator {uid} (delayed)")
+                except Exception:
+                    pass
+            
+            create_logged_task(
+                delayed_unfollow(client, owner_id, unfollow_delay),
+                f"delayed unfollow {owner_id}",
+            )
+        except Exception as e:
+            logger.warning(f"Error scheduling unfollow: {e}")
+        else:
+            await update.message.reply_text(
+                f"⏰ <b>No reply yet</b> from @{owner_username}.\n\n"
+                f"I’ll keep the thread ready, but this reel may not have an active automation reply.",
+                parse_mode="HTML"
+            )
+        # Still unfollow after delay even on timeout
+        try:
+            unfollow_delay = random.uniform(60, 180)
+            async def delayed_unfollow(cid, uid, delay):
+                await asyncio.sleep(delay)
+                try:
+                    await run_ig(cid, unfollow_user, uid)
+                except Exception:
+                    pass
+            create_logged_task(
+                delayed_unfollow(client, owner_id, unfollow_delay),
+                f"delayed unfollow {owner_id}",
+            )
+        except Exception:
+            pass
+        except Exception:
+            pass
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -1183,16 +2104,85 @@ def _is_pid_alive(pid: int) -> bool:
             return False
 
 
+def _is_our_bot_process(pid: int) -> bool:
+    """Return True if the PID appears to belong to this bot process."""
+    if sys.platform == "win32":
+        try:
+            cmd = subprocess.check_output(
+                [
+                    "powershell",
+                    "-NoProfile",
+                    "-Command",
+                    f"(Get-CimInstance Win32_Process -Filter \"ProcessId={pid}\").CommandLine",
+                ],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            ).strip()
+            return "bot.py" in cmd and "python" in cmd.lower()
+        except Exception:
+            return False
+
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            cmdline = f.read().decode("utf-8", errors="ignore").replace("\x00", " ")
+        return "bot.py" in cmdline and "python" in cmdline.lower()
+    except Exception:
+        return False
+
+
+def _kill_other_bot_processes():
+    """Kill ALL other python bot.py processes except ourselves."""
+    my_pid = os.getpid()
+    killed = []
+    if sys.platform == "win32":
+        return killed  # Windows: rely on lockfile only
+    try:
+        # Use /proc to find all python bot.py processes
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            pid = int(entry)
+            if pid == my_pid:
+                continue
+            try:
+                with open(f"/proc/{pid}/cmdline", "rb") as f:
+                    cmdline = f.read().decode("utf-8", errors="ignore").replace("\x00", " ")
+                if "bot.py" in cmdline and "python" in cmdline.lower():
+                    logger.warning("Killing duplicate bot process PID %s: %s", pid, cmdline.strip())
+                    os.kill(pid, 9)  # SIGKILL
+                    killed.append(pid)
+            except (OSError, PermissionError):
+                continue
+    except Exception as e:
+        logger.warning("Error scanning for duplicate processes: %s", e)
+    return killed
+
+
 def acquire_lock():
     """Ensure only one bot instance runs at a time using a lockfile with PID check."""
+    # Step 1: Always kill any other bot.py processes (belt-and-suspenders)
+    killed = _kill_other_bot_processes()
+    if killed:
+        print(f"🔪 Killed {len(killed)} duplicate bot process(es): {killed}")
+        time.sleep(2)  # Give OS time to clean up
+
+    # Step 2: Check the lockfile
     if os.path.exists(LOCK_FILE):
         try:
             with open(LOCK_FILE, "r") as f:
                 old_pid = int(f.read().strip())
-            if _is_pid_alive(old_pid):
-                print(f"❌ Another bot instance is already running (PID {old_pid}).")
-                print("   Kill it first, or delete bot.lock if it's stale.")
-                sys.exit(1)
+            if _is_pid_alive(old_pid) and old_pid != os.getpid():
+                # The kill above should have handled this, but double-check
+                if _is_our_bot_process(old_pid):
+                    print(f"❌ Another bot instance is STILL running (PID {old_pid}) after kill attempt.")
+                    print("   This should not happen. Force-killing again...")
+                    try:
+                        os.kill(old_pid, 9)
+                        time.sleep(2)
+                    except OSError:
+                        pass
+                else:
+                    print(f"🧹 Removing stale lockfile (PID {old_pid} is not a bot process)")
             else:
                 print(f"🧹 Removing stale lockfile (PID {old_pid} is gone)")
         except (ValueError, OSError):
@@ -1200,6 +2190,7 @@ def acquire_lock():
 
     with open(LOCK_FILE, "w") as f:
         f.write(str(os.getpid()))
+    print(f"🔒 Lock acquired (PID {os.getpid()})")
 
 
 def release_lock():
@@ -1245,24 +2236,40 @@ def main():
     # Initialize concurrency primitives
     thread_pool = ThreadPoolExecutor(max_workers=THREAD_POOL_SIZE)
 
+    # Initialize MVP Step 1 database
+    db_cache.init_db()
+
     print("🔐 Logging into Instagram...")
     login_instagram()
     if len(ig_clients) > 0:
-        print(f"✅ Connected as @{BOT_INSTAGRAM_USERNAME}")
+        active_usernames = ", @".join(get_active_ig_usernames()) or BOT_INSTAGRAM_USERNAME
+        print(f"✅ Connected as @{active_usernames}")
     else:
         print("⚠️ No Instagram clients logged in — will retry on first request")
 
     async def post_init(application):
-        """Start the Instagram DM listener background task."""
-        asyncio.create_task(ig_dm_listener())
+        """Start the background tasks."""
+        global action_queue
+        action_queue = asyncio.Queue()
+        
+        create_logged_task(
+            supervise_background_task("Instagram DM listener", ig_dm_listener),
+            "Instagram DM listener supervisor",
+        )
+        create_logged_task(
+            supervise_background_task("Action Queue Worker", action_queue_worker),
+            "Action Queue Worker supervisor",
+        )
 
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).build()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("status", status_cmd))
-    app.add_handler(CommandHandler("restart", restart))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.add_error_handler(error_handler)
+    def build_app():
+        app = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).build()
+        app.add_handler(CommandHandler("start", start))
+        app.add_handler(CommandHandler("status", status_cmd))
+        app.add_handler(CommandHandler("restart", restart))
+        app.add_handler(CommandHandler("set_session", set_session_cmd))
+        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+        app.add_error_handler(error_handler)
+        return app
 
     print("")
     print("🤖 Reel Link Bot is running!")
@@ -1279,7 +2286,14 @@ def main():
     ig_lock = asyncio.Lock()
     ig_semaphore = asyncio.Semaphore(MAX_CONCURRENT_IG_CALLS)
 
-    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+    app = build_app()
+    try:
+        app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+    except KeyboardInterrupt:
+        raise
+    except Exception:
+        logger.exception("Telegram polling loop crashed. Exiting to allow start_bot.sh to restart cleanly.")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

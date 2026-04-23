@@ -1,22 +1,41 @@
-# Secrets
+# ─── Secrets ──────────────────────────────────────────────────
 .env
+ec2key.pem
+session_b64.txt
+test_settings.json
 
-# Instagram session (contains auth tokens)
-ig_session.json
-
-# Lock file
+# ─── Logs ─────────────────────────────────────────────────────
+*.log
 bot.lock
+bot_status.txt
+dm_output.txt
+pw_error.png
 
-# Python
+# ─── Python ───────────────────────────────────────────────────
 __pycache__/
 *.pyc
 *.pyo
 venv/
 .venv/
 
-# Debug scripts
+# ─── Temp/Debug scripts ──────────────────────────────────────
+temp_*.py
+fix_*.py
+patch_*.py
 debug_*.py
+test_*.py
+check_*.py
+scratch/
 
-# OS
+# ─── IDE ──────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ─── OS ───────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db
+
+# ─── Backup ───────────────────────────────────────────────────
+*.bak
